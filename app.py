@@ -91,7 +91,7 @@ def transcribe_audio(file_path: str) -> str:
 
 
 # ---------------------------
-#  Create subtitle image using textbbox (Pillow 10+ safe)
+#  Create subtitle image (SAFE FOR PILLOW 10+)
 # ---------------------------
 def create_subtitle_image(text: str, video_w: int, video_h: int, fontsize: int = 56):
     text = prepare_hebrew_text(text)
@@ -102,37 +102,33 @@ def create_subtitle_image(text: str, video_w: int, video_h: int, fontsize: int =
     else:
         font = ImageFont.load_default()
 
-    # PIL needs dummy draw to measure text
-    dummy_img = Image.new("RGB", (100, 100))
-    draw = ImageDraw.Draw(dummy_img)
+    # Dummy image for measuring text
+    dummy = Image.new("RGB", (10, 10))
+    draw = ImageDraw.Draw(dummy)
 
-    # measure text using textbbox
+    # Use textbbox — ONLY — no getsize()
     bbox = draw.textbbox((0, 0), text, font=font, stroke_width=2)
     text_w = bbox[2] - bbox[0]
     text_h = bbox[3] - bbox[1]
 
-    # Image for subtitle
     padding = 25
-    bg = Image.new("RGBA", (text_w + padding*2, text_h + padding*2), (0,0,0,0))
-    draw2 = ImageDraw.Draw(bg)
+    img = Image.new("RGBA", (text_w + padding*2, text_h + padding*2), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
 
-    # draw dark semi-transparent box
-    draw2.rectangle(
-        [(0, 0), (bg.width, bg.height)],
-        fill=(0,0,0,150)
-    )
+    # Background box
+    d.rectangle([0, 0, img.width, img.height], fill=(0, 0, 0, 150))
 
-    # draw white text with black outline
-    draw2.text(
+    # Subtitle text
+    d.text(
         (padding, padding),
         text,
         font=font,
-        fill=(255,255,255,255),
+        fill=(255, 255, 255, 255),
         stroke_width=2,
-        stroke_fill=(0,0,0)
+        stroke_fill=(0, 0, 0)
     )
 
-    return bg
+    return img
 
 
 # ---------------------------
@@ -191,6 +187,7 @@ def handle_video(message):
 
     try:
         send_progress(chat_id, "🎬 מוריד את הסרטון...")
+
         file_info = bot.get_file(message.video.file_id)
         file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_info.file_path}"
         resp = requests.get(file_url, timeout=120)
@@ -199,16 +196,13 @@ def handle_video(message):
         tmp_video.write(resp.content)
         tmp_video.close()
 
-        # duration check
-        try:
-            clip = VideoFileClip(tmp_video.name)
-            if clip.duration > 5 * 60 + 5:
-                bot.reply_to(message, "❌ הסרטון ארוך מדי — המקסימום הוא 5 דקות.")
-                clip.close()
-                return
+        # Check length
+        clip = VideoFileClip(tmp_video.name)
+        if clip.duration > 5 * 60 + 5:
+            bot.reply_to(message, "❌ הסרטון ארוך מדי — המקסימום הוא 5 דקות.")
             clip.close()
-        except:
-            pass
+            return
+        clip.close()
 
         send_progress(chat_id, "🎧 ממיר את האודיו לטקסט...")
         text = transcribe_audio(tmp_video.name)
@@ -230,7 +224,6 @@ def handle_video(message):
         with open(out_video, "rb") as f:
             bot.send_video(chat_id, f, caption="✅ הנה הסרטון עם כתוביות!")
 
-        # cleanup
         os.remove(tmp_video.name)
         os.remove(out_video)
 
