@@ -14,6 +14,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # copy app
 COPY . .
 
+# copy fonts folder
+COPY fonts/ /app/fonts/
+
 EXPOSE 8080
 
 CMD ["python", "app.py"]
