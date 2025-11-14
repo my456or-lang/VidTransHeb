@@ -11,11 +11,10 @@ from moviepy.editor import VideoFileClip, CompositeVideoClip, ImageClip
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 from bidi.algorithm import get_display
-import arabic_reshaper
 import time
 
 # ---------------------------
-#  CONFIG / ENV
+# CONFIG / ENV
 # ---------------------------
 BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
@@ -26,14 +25,16 @@ if not GROQ_API_KEY:
     raise RuntimeError("GROQ_API_KEY לא מוגדר בסביבת הריצה")
 
 # ---------------------------
-#  Clients
+# CLIENTS
 # ---------------------------
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
 client = Groq(api_key=GROQ_API_KEY)
-translator = GoogleTranslator(source='auto', target='iw')
+
+# deep_translator מצפה לשמות כמו 'hebrew' -> ממפה ל-'iw'
+translator = GoogleTranslator(source='auto', target='hebrew')
 
 # ---------------------------
-#  Flask (כדי ש-Render יראה פורט פתוח)
+# Flask (so render sees an open port)
 # ---------------------------
 app = Flask(__name__)
 
@@ -42,31 +43,15 @@ def home():
     return "Telegram subtitle bot — running ✅"
 
 # ---------------------------
-#  Utilities: RTL + text shaping
+# Utils: font, find font path
 # ---------------------------
-def prepare_hebrew_text(text: str) -> str:
-    """
-    Apply reshaping (for Arabic-like scripts) and bidi display.
-    For Hebrew get_display is important to render right-to-left.
-    """
-    try:
-        # arabic_reshaper won't break hebrew; kept to handle mixed RTL scripts too
-        reshaped = arabic_reshaper.reshape(text)
-    except Exception:
-        reshaped = text
-    try:
-        bidi_text = get_display(reshaped)
-    except Exception:
-        bidi_text = reshaped
-    return bidi_text
-
 def find_font_path():
-    # preferred fonts that usually include Hebrew glyphs
+    # try common Linux fonts that contain Hebrew glyphs
     candidates = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-        "/usr/share/fonts/truetype/freefont/FreeSans.ttf"
+        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
     ]
     for p in candidates:
         if os.path.exists(p):
@@ -74,129 +59,139 @@ def find_font_path():
     return None
 
 # ---------------------------
-#  Transcription via Groq Whisper
+# Transcription via Groq Whisper (robust extraction)
 # ---------------------------
 def transcribe_audio(file_path: str) -> str:
-    try:
-        with open(file_path, "rb") as f:
-            # use whisper model
-            resp = client.audio.transcriptions.create(
-                model="whisper-large-v3-turbo",
-                file=f
-            )
-        # Depending on Groq response shape, try to extract text robustly
-        if isinstance(resp, dict):
-            # older style
-            return resp.get("text") or resp.get("transcript") or ""
-        # object with attribute
-        return getattr(resp, "text", "") or getattr(resp, "transcript", "") or str(resp)
-    except Exception as e:
-        # return empty and raise later
-        raise
+    with open(file_path, "rb") as f:
+        resp = client.audio.transcriptions.create(
+            model="whisper-large-v3-turbo",
+            file=f
+        )
+    # resp could be dict-like or object with .text
+    if isinstance(resp, dict):
+        return resp.get("text") or resp.get("transcript") or ""
+    return getattr(resp, "text", "") or getattr(resp, "transcript", "") or str(resp)
 
 # ---------------------------
-#  Create subtitle image (style B: white text with black stroke, bottom)
+# Wrapping and RTL handling
 # ---------------------------
-def create_subtitle_image(text: str, video_w: int, video_h: int, fontsize: int = 56, max_width_ratio: float = 0.9):
+def wrap_text_rtl_logical(text: str, draw: ImageDraw.Draw, font, max_width: int):
     """
-    Returns a PIL Image (RGBA) containing the subtitle block to overlay.
-    Style B: white text with black stroke, aligned to right, placed near bottom.
+    Build lines for display. We keep logical order when building lines
+    (so words are concatenated in their logical order), but measure
+    visual width using get_display() to ensure correct wrapping for RTL.
+    Returns list of lines (logical strings).
     """
-    # Prepare text for RTL
-    text = prepare_hebrew_text(text)
+    words = text.strip().split()
+    if not words:
+        return []
 
-    # Choose font
-    font_path = find_font_path()
-    if not font_path:
-        # fallback to default PIL font (smaller, might not have Hebrew)
-        font = ImageFont.load_default()
-    else:
-        font = ImageFont.truetype(font_path, fontsize)
-
-    max_width = int(video_w * max_width_ratio)
-    # We will wrap text to lines that fit max_width
-    # simple greedy wrap using ImageDraw.textbbox
-    dummy_img = Image.new("RGBA", (10, 10), (0,0,0,0))
-    draw = ImageDraw.Draw(dummy_img)
-
-    words = text.split()
     lines = []
-    current = ""
-    for w in words:
-        candidate = (w + " " + current).strip()  # keep RTL-friendly order for drawing
-        bbox = draw.textbbox((0,0), candidate, font=font)
-        wbox = bbox[2] - bbox[0]
-        if wbox <= max_width:
-            current = candidate
+    current = words[0]
+
+    for w in words[1:]:
+        candidate_logical = current + " " + w  # keep logical order
+        candidate_visual = get_display(candidate_logical)
+        bbox = draw.textbbox((0,0), candidate_visual, font=font, stroke_width=2)
+        width = bbox[2] - bbox[0]
+        if width <= max_width:
+            current = candidate_logical
         else:
-            if current:
-                lines.append(current)
+            lines.append(current)
             current = w
     if current:
         lines.append(current)
+    return lines
 
-    # Now compute image height
-    line_height = font.getsize("A")[1] + 12 if hasattr(font, "getsize") else fontsize + 12
-    total_height = line_height * len(lines) + 30  # padding
+# ---------------------------
+# Create subtitle image (RTL-ready)
+# ---------------------------
+def create_subtitle_image(text: str, video_w: int, fontsize: int = 48, max_width_ratio: float = 0.9):
+    """
+    Returns PIL RGBA image containing subtitle block (bottom-centered),
+    with right alignment and stroke for readability.
+    Input 'text' is logical Hebrew text (normal).
+    """
+    font_path = find_font_path()
+    if font_path:
+        font = ImageFont.truetype(font_path, fontsize)
+    else:
+        font = ImageFont.load_default()
+
+    max_width = int(video_w * max_width_ratio)
+
+    # dummy image for measuring
+    dummy = Image.new("RGBA", (10,10), (0,0,0,0))
+    draw = ImageDraw.Draw(dummy)
+
+    lines_logical = wrap_text_rtl_logical(text, draw, font, max_width)
+
+    # compute line height
+    try:
+        ascent, descent = font.getmetrics()
+        line_h = ascent + descent + 8
+    except Exception:
+        line_h = fontsize + 12
+
+    total_height = line_h * len(lines_logical) + 20  # padding
 
     img = Image.new("RGBA", (video_w, total_height), (0,0,0,0))
     draw = ImageDraw.Draw(img)
 
-    # draw semi-opaque black rounded rectangle background (subtle)
-    padding_x = 20
-    padding_y = 10
-    rect_left = (video_w - max_width) // 2 - padding_x
-    rect_right = rect_left + max_width + padding_x*2
+    # background rectangle
+    padding_x = 18
+    padding_y = 8
+    rect_w = max_width + padding_x * 2
+    rect_left = (video_w - rect_w) // 2
+    rect_right = rect_left + rect_w
     rect_top = 0
     rect_bottom = total_height
-    # semi-transparent dark rectangle
-    draw.rectangle([rect_left, rect_top, rect_right, rect_bottom], fill=(0,0,0,180))
+    draw.rectangle([rect_left, rect_top, rect_right, rect_bottom], fill=(0,0,0,160))
 
-    # draw lines from top->bottom but each line right-aligned
+    # draw each line right-aligned inside rect
     y = padding_y
-    for line in lines:
-        # compute bbox for this line
-        bbox = draw.textbbox((0,0), line, font=font, stroke_width=2)
+    for logical_line in lines_logical:
+        visual_line = get_display(logical_line)  # prepare visual order for rendering
+        bbox = draw.textbbox((0,0), visual_line, font=font, stroke_width=2)
         tw = bbox[2] - bbox[0]
-        x = rect_right - padding_x - tw  # right align inside rect
-        # Pillow supports stroke_* params for text since recent versions
+        x = rect_right - padding_x - tw  # right align
+        # draw with stroke if available
         try:
-            draw.text((x, y), line, font=font, fill=(255,255,255,255),
-                      stroke_width=2, stroke_fill=(0,0,0,255), align="right")
+            draw.text((x, y), visual_line, font=font, fill=(255,255,255,255),
+                      stroke_width=2, stroke_fill=(0,0,0,255))
         except TypeError:
-            # older Pillow compatibility: draw outline manually
-            outline_color = (0,0,0,255)
+            # older Pillow - emulate stroke
+            outline = (0,0,0,255)
             for ox, oy in [(-1,0),(1,0),(0,-1),(0,1)]:
-                draw.text((x+ox, y+oy), line, font=font, fill=outline_color)
-            draw.text((x, y), line, font=font, fill=(255,255,255,255))
-        y += line_height
+                draw.text((x+ox, y+oy), visual_line, font=font, fill=outline)
+            draw.text((x, y), visual_line, font=font, fill=(255,255,255,255))
+        y += line_h
 
     return img
 
 # ---------------------------
-#  Burn subtitles onto video (hard-coded)
+# Burn subtitles onto video
 # ---------------------------
 def burn_subtitles_on_video(video_path: str, translated_text: str) -> str:
     clip = VideoFileClip(video_path)
     w, h = clip.w, clip.h
 
-    # create subtitle image sized to video width
-    subtitle_img = create_subtitle_image(translated_text, w, h, fontsize=max(28, int(w/30)))
-    # Convert to ImageClip
+    fontsize = max(26, int(w / 28))
+    subtitle_img = create_subtitle_image(translated_text, video_w=w, fontsize=fontsize)
     subtitle_np = np.array(subtitle_img)
     subtitle_clip = ImageClip(subtitle_np).set_duration(clip.duration).set_position(("center", h - subtitle_img.height - 20))
 
     final = CompositeVideoClip([clip, subtitle_clip])
-    out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
-    # write with reasonable settings
-    final.write_videofile(out_path, codec="libx264", audio_codec="aac", threads=2, preset="ultrafast", verbose=False)
+    out_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+    # use ultrafast preset to speed up on small instances; adjust as needed
+    final.write_videofile(out_tmp, codec="libx264", audio_codec="aac", threads=2, preset="ultrafast", verbose=False)
     clip.close()
     subtitle_clip.close()
     final.close()
-    return out_path
+    return out_tmp
 
 # ---------------------------
-#  small helper: send progress messages
+# small helper: send progress messages
 # ---------------------------
 def send_progress(chat_id, text):
     try:
@@ -205,11 +200,11 @@ def send_progress(chat_id, text):
         pass
 
 # ---------------------------
-#  Telegram handler
+# Telegram handlers
 # ---------------------------
 @bot.message_handler(commands=['start'])
 def on_start(msg):
-    bot.reply_to(msg, "👋 היי! שלח סרטון (עד 5 דקות) ואחזיר לך אותו עם כתוביות בעברית (Hard-coded).")
+    bot.reply_to(msg, "👋 היי! שלח סרטון (עד 5 דקות) ואחזיר לך אותו עם כתוביות בעברית בתחתית הסרטון.")
 
 @bot.message_handler(content_types=['video'])
 def handle_video(message):
@@ -254,7 +249,8 @@ def handle_video(message):
         try:
             translated = translator.translate(text)
         except Exception as e:
-            bot.reply_to(message, f"❌ שגיאה בתרגום: {e}")
+            # אם יש בעיה בתרגום נחזיר את הטקסט המקורי (באנגלית) ונמשיך
+            bot.reply_to(message, f"⚠ שגיאה בתרגום — ישלח הטקסט המקורי.\n{e}")
             translated = text
 
         send_progress(chat_id, "🔥 שורף כתוביות על הווידאו (זה עשוי לקחת כמה דקות)...")
@@ -268,16 +264,16 @@ def handle_video(message):
 
         send_progress(chat_id, "📤 מעלה את הסרטון בחזרה...")
         with open(out_video, "rb") as f:
-            bot.send_video(chat_id, f, caption="✅ הנה הסרטון שלך עם כתוביות בעברית (Hard-coded).")
+            bot.send_video(chat_id, f, caption="✅ הנה הסרטון שלך עם כתוביות בעברית.")
 
         # cleanup
         try:
             os.remove(tmp_video.name)
-        except OSError:
+        except Exception:
             pass
         try:
             os.remove(out_video)
-        except OSError:
+        except Exception:
             pass
 
     except Exception as e:
@@ -285,7 +281,7 @@ def handle_video(message):
         bot.reply_to(message, f"❌ שגיאה כללית: {e}\n{tb}")
 
 # ---------------------------
-#  Run bot + Flask for Render
+# Run bot + Flask for Render
 # ---------------------------
 def run_bot():
     bot.infinity_polling(timeout=60, long_polling_timeout=60)
