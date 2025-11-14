@@ -33,7 +33,7 @@ client = Groq(api_key=GROQ_API_KEY)
 translator = GoogleTranslator(source='auto', target='iw')
 
 # ---------------------------
-#  Flask (כדי ש-Render יראה פורט פתוח)
+#  Flask (לשירות Render)
 # ---------------------------
 app = Flask(__name__)
 
@@ -43,7 +43,7 @@ def home():
 
 
 # ---------------------------
-#  Utilities: RTL + text shaping
+#  Prepare Hebrew text
 # ---------------------------
 def prepare_hebrew_text(text: str) -> str:
     try:
@@ -58,15 +58,21 @@ def prepare_hebrew_text(text: str) -> str:
 
 
 # ---------------------------
-#  Hebrew Font Loader (your font)
+# Load Hebrew Font
 # ---------------------------
-def find_font_path():
-    """
-    Load your Hebrew font from the bundled fonts folder.
-    """
-    local_font = "fonts/NotoSansHebrew-VariableFont_wdth,wght.ttf"
-    if os.path.exists(local_font):
-        return local_font
+def find_font():
+    custom_font = "fonts/NotoSansHebrew-VariableFont_wdth,wght.ttf"
+    if os.path.exists(custom_font):
+        return custom_font
+
+    # fallback fonts
+    for p in [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"
+    ]:
+        if os.path.exists(p):
+            return p
+
     return None
 
 
@@ -79,108 +85,100 @@ def transcribe_audio(file_path: str) -> str:
             model="whisper-large-v3-turbo",
             file=f
         )
-
     if isinstance(resp, dict):
         return resp.get("text") or resp.get("transcript") or ""
-    return getattr(resp, "text", "") or getattr(resp, "transcript", "") or str(resp)
+    return getattr(resp, "text", "")
 
 
 # ---------------------------
-#  Create subtitle image
+#  Create subtitle image using textbbox (Pillow 10+ safe)
 # ---------------------------
-def create_subtitle_image(text: str, video_w: int, video_h: int, fontsize: int = 56, max_width_ratio: float = 0.9):
+def create_subtitle_image(text: str, video_w: int, video_h: int, fontsize: int = 56):
     text = prepare_hebrew_text(text)
 
-    font_path = find_font_path()
-    if not font_path:
-        font = ImageFont.load_default()
-    else:
+    font_path = find_font()
+    if font_path:
         font = ImageFont.truetype(font_path, fontsize)
+    else:
+        font = ImageFont.load_default()
 
-    max_width = int(video_w * max_width_ratio)
-
-    dummy_img = Image.new("RGBA", (10, 10), (0,0,0,0))
+    # PIL needs dummy draw to measure text
+    dummy_img = Image.new("RGB", (100, 100))
     draw = ImageDraw.Draw(dummy_img)
 
-    words = text.split()
-    lines = []
-    current = ""
-    for w in words:
-        candidate = (w + " " + current).strip()
-        bbox = draw.textbbox((0,0), candidate, font=font)
-        wbox = bbox[2] - bbox[0]
-        if wbox <= max_width:
-            current = candidate
-        else:
-            if current:
-                lines.append(current)
-            current = w
-    if current:
-        lines.append(current)
+    # measure text using textbbox
+    bbox = draw.textbbox((0, 0), text, font=font, stroke_width=2)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
 
-    line_height = font.getsize("A")[1] + 12
-    total_height = line_height * len(lines) + 30
+    # Image for subtitle
+    padding = 25
+    bg = Image.new("RGBA", (text_w + padding*2, text_h + padding*2), (0,0,0,0))
+    draw2 = ImageDraw.Draw(bg)
 
-    img = Image.new("RGBA", (video_w, total_height), (0,0,0,0))
-    draw = ImageDraw.Draw(img)
+    # draw dark semi-transparent box
+    draw2.rectangle(
+        [(0, 0), (bg.width, bg.height)],
+        fill=(0,0,0,150)
+    )
 
-    padding_x = 20
-    padding_y = 10
-    rect_left = (video_w - max_width) // 2 - padding_x
-    rect_right = rect_left + max_width + padding_x*2
-    rect_top = 0
-    rect_bottom = total_height
+    # draw white text with black outline
+    draw2.text(
+        (padding, padding),
+        text,
+        font=font,
+        fill=(255,255,255,255),
+        stroke_width=2,
+        stroke_fill=(0,0,0)
+    )
 
-    draw.rectangle([rect_left, rect_top, rect_right, rect_bottom], fill=(0,0,0,180))
-
-    y = padding_y
-    for line in lines:
-        bbox = draw.textbbox((0,0), line, font=font, stroke_width=2)
-        tw = bbox[2] - bbox[0]
-        x = rect_right - padding_x - tw
-        draw.text((x, y), line, font=font, fill=(255,255,255,255),
-                  stroke_width=2, stroke_fill=(0,0,0,255))
-        y += line_height
-
-    return img
+    return bg
 
 
 # ---------------------------
-#  Burn subtitles
+# Burn subtitles onto video
 # ---------------------------
-def burn_subtitles_on_video(video_path: str, translated_text: str) -> str:
+def burn_subtitles_on_video(video_path: str, translated_text: str):
     clip = VideoFileClip(video_path)
     w, h = clip.w, clip.h
 
     subtitle_img = create_subtitle_image(translated_text, w, h, fontsize=max(28, int(w/30)))
-
     subtitle_np = np.array(subtitle_img)
-    subtitle_clip = ImageClip(subtitle_np).set_duration(clip.duration).set_position(("center", h - subtitle_img.height - 20))
+
+    subtitle_clip = ImageClip(subtitle_np)\
+        .set_duration(clip.duration)\
+        .set_position(("center", h - subtitle_img.height - 40))
 
     final = CompositeVideoClip([clip, subtitle_clip])
     out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
 
-    final.write_videofile(out_path, codec="libx264", audio_codec="aac", threads=2, preset="ultrafast", verbose=False)
+    final.write_videofile(
+        out_path,
+        codec="libx264",
+        audio_codec="aac",
+        threads=2,
+        preset="ultrafast",
+        verbose=False
+    )
 
     clip.close()
     subtitle_clip.close()
     final.close()
-
     return out_path
 
 
 # ---------------------------
-#  Send progress
+#  Send progress message
 # ---------------------------
 def send_progress(chat_id, text):
     try:
         bot.send_message(chat_id, text)
-    except Exception:
+    except:
         pass
 
 
 # ---------------------------
-#  Telegram handlers
+#  Telegram message handler
 # ---------------------------
 @bot.message_handler(commands=['start'])
 def on_start(msg):
@@ -193,76 +191,59 @@ def handle_video(message):
 
     try:
         send_progress(chat_id, "🎬 מוריד את הסרטון...")
-
         file_info = bot.get_file(message.video.file_id)
         file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_info.file_path}"
         resp = requests.get(file_url, timeout=120)
 
         tmp_video = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
         tmp_video.write(resp.content)
-        tmp_video.flush()
         tmp_video.close()
 
+        # duration check
         try:
             clip = VideoFileClip(tmp_video.name)
-            dur = clip.duration
+            if clip.duration > 5 * 60 + 5:
+                bot.reply_to(message, "❌ הסרטון ארוך מדי — המקסימום הוא 5 דקות.")
+                clip.close()
+                return
             clip.close()
         except:
-            dur = None
-
-        if dur and dur > 305:
-            bot.reply_to(message, "❌ הסרטון ארוך מדי — המקסימום הוא 5 דקות.")
-            os.remove(tmp_video.name)
-            return
+            pass
 
         send_progress(chat_id, "🎧 ממיר את האודיו לטקסט...")
-
-        try:
-            text = transcribe_audio(tmp_video.name)
-        except Exception as e:
-            bot.reply_to(message, f"❌ שגיאה בתמלול: {e}")
-            os.remove(tmp_video.name)
-            return
+        text = transcribe_audio(tmp_video.name)
 
         if not text.strip():
             bot.reply_to(message, "❌ לא זוהה דיבור בסרטון.")
-            os.remove(tmp_video.name)
             return
 
         send_progress(chat_id, "🔠 מתרגם לעברית...")
-
         try:
             translated = translator.translate(text)
-        except Exception:
+        except:
             translated = text
 
         send_progress(chat_id, "🔥 שורף כתוביות על הווידאו...")
-
-        try:
-            out_video = burn_subtitles_on_video(tmp_video.name, translated)
-        except Exception as e:
-            bot.reply_to(message, f"❌ שגיאה ביצירת כתוביות:\n{e}")
-            os.remove(tmp_video.name)
-            return
+        out_video = burn_subtitles_on_video(tmp_video.name, translated)
 
         send_progress(chat_id, "📤 מעלה את הסרטון...")
-
         with open(out_video, "rb") as f:
-            bot.send_video(chat_id, f, caption="✅ הנה הסרטון שלך עם כתוביות בעברית!")
+            bot.send_video(chat_id, f, caption="✅ הנה הסרטון עם כתוביות!")
 
+        # cleanup
         os.remove(tmp_video.name)
         os.remove(out_video)
 
     except Exception as e:
-        bot.reply_to(message, f"❌ שגיאה כללית: {e}")
+        tb = traceback.format_exc()
+        bot.reply_to(message, f"❌ שגיאה: {e}\n{tb}")
 
 
 # ---------------------------
-#  Run
+#  Run bot + Flask
 # ---------------------------
 def run_bot():
     bot.infinity_polling(timeout=60, long_polling_timeout=60)
-
 
 if __name__ == "__main__":
     t = threading.Thread(target=run_bot, daemon=True)
