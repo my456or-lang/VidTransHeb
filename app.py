@@ -30,7 +30,7 @@ if not GROQ_API_KEY:
 # ---------------------------
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
 client = Groq(api_key=GROQ_API_KEY)
-translator = GoogleTranslator(source='auto', target='he')
+translator = GoogleTranslator(source='auto', target='wi')
 
 # ---------------------------
 #  Flask (כדי ש-Render יראה פורט פתוח)
