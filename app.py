@@ -10,12 +10,8 @@ from deep_translator import GoogleTranslator
 from moviepy.editor import VideoFileClip, CompositeVideoClip, ImageClip
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
-from bidi.algorithm import get_display
 import time
 
-# ==========================================================
-#  CONFIG
-# ==========================================================
 BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
@@ -24,235 +20,184 @@ if not BOT_TOKEN:
 if not GROQ_API_KEY:
     raise RuntimeError("GROQ_API_KEY לא מוגדר")
 
-bot = telebot.TeleBot(BOT_TOKEN)
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
 client = Groq(api_key=GROQ_API_KEY)
 translator = GoogleTranslator(source='auto', target='iw')
 
-# ==========================================================
-#  FLASK (Render keepalive)
-# ==========================================================
 app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "Subtitle bot running ✔️"
+    return "Telegram subtitle bot — running ✅"
 
+# ---------- FONT ----------
+def get_hebrew_font(fontsize=48):
+    local_font = "fonts/NotoSansHebrew.ttf"
+    if os.path.exists(local_font):
+        return ImageFont.truetype(local_font, fontsize)
 
-# ==========================================================
-#  Prepare RTL Hebrew text
-# ==========================================================
-def prepare_hebrew_text(text: str) -> str:
-    """Fix RTL order using bidi only – NO arabic reshaping."""
-    try:
-        return get_display(text)
-    except:
-        return text
-
-
-# ==========================================================
-#  Load font
-# ==========================================================
-def find_font():
-    custom_font = "fonts/NotoSansHebrew-VariableFont_wdth,wght.ttf"
-    if os.path.exists(custom_font):
-        return custom_font
-
-    # fallback fonts
-    for p in [
+    # fallback
+    return ImageFont.truetype(
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-    ]:
-        if os.path.exists(p):
-            return p
+        fontsize
+    )
 
-    return None
-
-
-# ==========================================================
-#  Wrap text into RTL lines
-# ==========================================================
+# ---------- WRAP TEXT RTL ----------
 def wrap_text(text, draw, font, max_width):
     words = text.split()
-    if not words:
-        return [""]
-
     lines = []
-    current = words[0]
+    current = ""
 
-    for w in words[1:]:
-        test = current + " " + w
+    for w in words:
+        test = (w if not current else current + " " + w)
         bbox = draw.textbbox((0, 0), test, font=font, stroke_width=2)
-        width = bbox[2] - bbox[0]
-        if width <= max_width:
+        w_box = bbox[2] - bbox[0]
+
+        if w_box <= max_width:
             current = test
         else:
             lines.append(current)
             current = w
 
-    lines.append(current)
+    if current:
+        lines.append(current)
+
     return lines
 
+# ---------- CREATE SUBTITLE RECTANGLE ----------
+def create_subtitle_image(text, video_w, video_h):
 
-# ==========================================================
-#  Transcribe audio
-# ==========================================================
-def transcribe_audio(file_path: str) -> str:
-    with open(file_path, "rb") as f:
-        resp = client.audio.transcriptions.create(
-            model="whisper-large-v3-turbo",
-            file=f
-        )
-    return getattr(resp, "text", "") or ""
+    fontsize = max(22, int(video_w / 32))
+    font = get_hebrew_font(fontsize)
 
-
-# ==========================================================
-#  Create subtitle image (multi-line RTL)
-# ==========================================================
-def create_subtitle_image(text: str, video_w: int):
-    text = prepare_hebrew_text(text)
-    font_path = find_font()
-    font = ImageFont.truetype(font_path, 48) if font_path else ImageFont.load_default()
-
-    dummy = Image.new("RGBA", (10, 10))
+    dummy = Image.new("RGBA", (10, 10), (0,0,0,0))
     draw = ImageDraw.Draw(dummy)
 
-    max_width = int(video_w * 0.88)
-    lines = wrap_text(text, draw, font, max_width)
+    max_text_width = int(video_w * 0.92)
 
-    # measure
-    line_heights = []
-    line_widths = []
+    lines = wrap_text(text, draw, font, max_text_width)
 
-    for ln in lines:
-        bbox = draw.textbbox((0, 0), ln, font=font, stroke_width=2)
-        w = bbox[2] - bbox[0]
-        h = bbox[3] - bbox[1]
-        line_widths.append(w)
-        line_heights.append(h)
+    # Measure rectangle size
+    line_sizes = [draw.textbbox((0,0), line, font=font, stroke_width=2) for line in lines]
+    widths = [(x2-x1) for (x1,y1,x2,y2) in line_sizes]
+    heights = [(y2-y1) for (x1,y1,x2,y2) in line_sizes]
 
-    pad_x = 24
-    pad_y = 10
+    padding_x = 25
+    padding_y = 12
 
-    img_w = max(line_widths) + pad_x * 2
-    img_h = sum(line_heights) + pad_y * (len(lines) + 1)
+    total_w = min(video_w - 40, max(widths) + padding_x * 2)
+    total_h = sum(heights) + padding_y * (len(lines)+1)
 
-    img = Image.new("RGBA", (img_w, img_h), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    d.rectangle([0, 0, img_w, img_h], fill=(0, 0, 0, 160))
+    img = Image.new("RGBA", (total_w, total_h), (0,0,0,160))
+    draw2 = ImageDraw.Draw(img)
 
-    y = pad_y
-    for i, ln in enumerate(lines):
-        line_w = line_widths[i]
-        x = img_w - pad_x - line_w  # RTL right align
-        d.text((x, y), ln, font=font,
-               fill="white", stroke_width=2, stroke_fill="black")
-        y += line_heights[i] + pad_y
+    y = padding_y
+    for i, line in enumerate(lines):
+        line_width = widths[i]
+        x = total_w - padding_x - line_width  # RIGHT ALIGN
+
+        draw2.text(
+            (x, y), line,
+            font=font,
+            fill=(255,255,255,255),
+            stroke_width=2,
+            stroke_fill=(0,0,0,255)
+        )
+
+        y += heights[i] + padding_y
 
     return img
 
+# ---------- BURN SUBTITLES ----------
+def burn_subtitles_on_video(video_path, translated_text):
 
-# ==========================================================
-#  Burn onto video
-# ==========================================================
-def burn_subtitles_on_video(video_path: str, text: str):
     clip = VideoFileClip(video_path)
     w, h = clip.w, clip.h
 
-    img = create_subtitle_image(text, w)
-    arr = np.array(img)
+    img = create_subtitle_image(translated_text, w, h)
+    img_np = np.array(img)
 
-    sub = ImageClip(arr).set_duration(clip.duration)
-    sub = sub.set_position(("center", h - img.height - 40))
+    subtitle = ImageClip(img_np)\
+        .set_duration(clip.duration)\
+        .set_position(("center", h - img.height - 30))
 
-    final = CompositeVideoClip([clip, sub])
-    out = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+    final = CompositeVideoClip([clip, subtitle])
 
-    final.write_videofile(out, codec="libx264", audio_codec="aac",
-                          threads=2, preset="ultrafast", verbose=False)
+    out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+    final.write_videofile(
+        out_path,
+        codec="libx264",
+        audio_codec="aac",
+        preset="ultrafast",
+        threads=2,
+        verbose=False
+    )
 
     clip.close()
-    sub.close()
+    subtitle.close()
     final.close()
+    return out_path
 
-    return out
-
-
-# ==========================================================
-#  Telegram handlers
-# ==========================================================
-def send_progress(chat_id, msg):
+# ---------- TELEGRAM ----------
+def send_progress(chat_id, text):
     try:
-        bot.send_message(chat_id, msg)
+        bot.send_message(chat_id, text)
     except:
         pass
 
-
 @bot.message_handler(commands=['start'])
-def start(msg):
-    bot.reply_to(msg, "🎬 שלח סרטון (עד 5 דקות) ואחזיר עם כתוביות בעברית.")
-
+def on_start(msg):
+    bot.reply_to(msg, "👋 שלח סרטון עד 5 דקות ואחזיר אותו עם כתוביות בעברית!")
 
 @bot.message_handler(content_types=['video'])
 def handle_video(message):
+
     chat_id = message.chat.id
 
     try:
         send_progress(chat_id, "📥 מוריד את הסרטון...")
-
         file_info = bot.get_file(message.video.file_id)
         file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_info.file_path}"
+        video_bytes = requests.get(file_url).content
 
-        resp = requests.get(file_url, timeout=120)
+        temp_video = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        temp_video.write(video_bytes)
+        temp_video.close()
 
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-        tmp.write(resp.content)
-        tmp.close()
-
-        # length check
-        clip = VideoFileClip(tmp.name)
+        clip = VideoFileClip(temp_video.name)
         if clip.duration > 305:
-            bot.send_message(chat_id, "❌ עד 5 דקות בלבד.")
+            bot.reply_to(message, "❌ הסרטון ארוך מדי (מעל 5 דקות)")
             clip.close()
             return
         clip.close()
 
-        send_progress(chat_id, "🔊 מפענח אודיו...")
-        text = transcribe_audio(tmp.name)
-
-        if not text.strip():
-            bot.send_message(chat_id, "❌ לא זוהה דיבור.")
-            return
+        send_progress(chat_id, "🎧 מפענח אודיו...")
+        text = client.audio.transcriptions.create(
+            model="whisper-large-v3-turbo",
+            file=open(temp_video.name, "rb")
+        ).text
 
         send_progress(chat_id, "🌍 מתרגם לעברית...")
-        try:
-            heb = translator.translate(text)
-        except:
-            heb = text
+        translated = translator.translate(text)
 
         send_progress(chat_id, "🔥 שורף כתוביות על הווידאו...")
-        out = burn_subtitles_on_video(tmp.name, heb)
+        out_path = burn_subtitles_on_video(temp_video.name, translated)
 
         send_progress(chat_id, "📤 מעלה את הסרטון...")
-        with open(out, "rb") as f:
-            bot.send_video(chat_id, f, caption="✔️ מוכן!")
+        with open(out_path, "rb") as f:
+            bot.send_video(chat_id, f, caption="הנה הסרטון עם כתוביות! ✅")
 
-        os.remove(tmp.name)
-        os.remove(out)
+        os.remove(temp_video.name)
+        os.remove(out_path)
 
     except Exception as e:
-        bot.send_message(chat_id, f"⚠️ שגיאה: {e}")
-        print(traceback.format_exc())
+        bot.send_message(chat_id, f"❌ שגיאה: {e}\n{traceback.format_exc()}")
 
-
-# ==========================================================
-#  RUN
-# ==========================================================
+# ---------- START ----------
 def run_bot():
     bot.infinity_polling(timeout=60, long_polling_timeout=60)
-
 
 if __name__ == "__main__":
     t = threading.Thread(target=run_bot, daemon=True)
     t.start()
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
