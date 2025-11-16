@@ -204,7 +204,7 @@ def handle_video(message):
         for s in segments:
             s["text"] = translator.translate(s["text"])
 
-        send_progress(chat, "🔥 שורף כתוביות (עם offset של 1.5 שנייה)...")
+        send_progress(chat, "🔥 שורף כתוביות (עם offset של 1.8 שנייה)...")
         out_path = burn_subtitles(temp.name, segments, offset=1.0)
 
         send_progress(chat, "📤 מעלה את הסרטון...")
