@@ -44,7 +44,7 @@ def get_hebrew_font(size=48):
 
 
 # ============================================
-# WRAP RTL TEXT (WITHOUT bidi, WITHOUT reshape!)
+# WRAP RTL TEXT
 # ============================================
 def wrap_rtl(text, draw, font, max_width):
     words = text.split()
@@ -95,7 +95,7 @@ def create_subtitle_image(text, video_w, video_h):
     y = pad_y
     for i, line in enumerate(lines):
         lw = widths[i]
-        x = total_w - pad_x - lw  # RIGHT ALIGN
+        x = total_w - pad_x - lw
 
         draw2.text(
             (x, y),
@@ -113,7 +113,7 @@ def create_subtitle_image(text, video_w, video_h):
 # ============================================
 # BURN SUBTITLES (SEGMENTED)
 # ============================================
-def burn_subtitles(video_path, segments, offset=1.0):
+def burn_subtitles(video_path, segments, offset=1.5):  # ← כאן שונה ל־1.5
 
     clip = VideoFileClip(video_path)
     w, h = clip.w, clip.h
@@ -155,7 +155,7 @@ def burn_subtitles(video_path, segments, offset=1.0):
 
 
 # ============================================
-# TELEGRAM
+# TELEGRAM HANDLER
 # ============================================
 def send_progress(chat_id, text):
     try:
@@ -199,13 +199,12 @@ def handle_video(message):
 
         segments = resp.segments
 
-        # Translate each segment
-        send_progress(chat, "🌍 מתרגם...")
+        send_progress(chat, "🌍 מתרגם כל שורה...")
         for s in segments:
             s["text"] = translator.translate(s["text"])
 
-        send_progress(chat, "🔥 שורף כתוביות (עם offset של 2.5 שנייה)...")
-        out_path = burn_subtitles(temp.name, segments, offset=1.0)
+        send_progress(chat, "🔥 שורף כתוביות (offset 1.5s)...")
+        out_path = burn_subtitles(temp.name, segments, offset=1.5)  # ← כאן שונה ל־1.5
 
         send_progress(chat, "📤 מעלה את הסרטון...")
         with open(out_path, "rb") as f:
