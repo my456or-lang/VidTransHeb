@@ -113,12 +113,12 @@ def create_subtitle_image(text, video_w, video_h):
 # ============================================
 # BURN SUBTITLES (SEGMENTED)
 # ============================================
-def burn_subtitles(video_path, segments, offset=1.5):  # ← כאן שונה ל־1.5
+def burn_subtitles(video_path, segments, offset=1.8):  # ← כאן שונה ל־1.8
 
     clip = VideoFileClip(video_path)
     w, h = clip.w, clip.h
 
-    subtitle_clips = []
+    subtitle_clips = []q
 
     for seg in segments:
         start = seg["start"] + offset
@@ -204,7 +204,7 @@ def handle_video(message):
             s["text"] = translator.translate(s["text"])
 
         send_progress(chat, "🔥 שורף כתוביות (offset 1.5s)...")
-        out_path = burn_subtitles(temp.name, segments, offset=1.5)  # ← כאן שונה ל־1.5
+        out_path = burn_subtitles(temp.name, segments, offset=1.8)  # ← כאן שונה ל־1.8
 
         send_progress(chat, "📤 מעלה את הסרטון...")
         with open(out_path, "rb") as f:
