@@ -7,9 +7,9 @@ from flask import Flask
 import telebot
 from groq import Groq
 from deep_translator import GoogleTranslator
-from moviepy.editor import VideoFileClip, CompositeVideoClip, ImageClip
-from PIL import Image, ImageDraw, ImageFont
-import numpy as np
+# מהייבוא של moviepy/PIL נשאר רק מה שדרוש לטעינת הגופן
+from PIL import ImageFont
+import ffmpeg # **חדש: נדרש לחילוץ אודיו וצריבה מהירה**
 
 # ============================================
 # ENV
@@ -37,127 +37,79 @@ def home():
 # FONT
 # ============================================
 def get_hebrew_font(size=48):
+    """מחזיר נתיב לגופן העברי."""
     font_path = "fonts/NotoSansHebrew.ttf"
     if os.path.exists(font_path):
-        return ImageFont.truetype(font_path, size)
-    return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", size)
+        # במקרה של הרצה מקומית
+        return font_path 
+    # עבור סביבות דוקר/רנדר שבהן הנתיב מוגדר ב-Dockerfile
+    return "NotoSansHebrew.ttf" 
 
 
 # ============================================
-# WRAP RTL TEXT
+# CREATE SRT FILE (משתמש בלוגיקת ה-segments הקיימת)
 # ============================================
-def wrap_rtl(text, draw, font, max_width):
-    words = text.split()
-    lines = []
-    current = ""
+def create_srt_file(segments, offset=1.8):
+    """יוצר קובץ SRT מקטעי התרגום."""
+    srt_path = tempfile.NamedTemporaryFile(delete=False, suffix=".srt", mode="w", encoding="utf-8").name
+    
+    with open(srt_path, "w", encoding="utf-8") as f:
+        for i, seg in enumerate(segments):
+            start = seg["start"] + offset
+            end = seg["end"] + offset
+            text = seg["text"]
 
-    for w in words:
-        test = w if not current else current + " " + w
-        w_box = draw.textbbox((0,0), test, font=font, stroke_width=2)[2]
+            # פורמט זמן SRT: HH:MM:SS,mmm
+            start_str = f"{int(start // 3600):02}:{int((start % 3600) // 60):02}:{int(start % 60):02},{int((start * 1000) % 1000):03}"
+            end_str = f"{int(end // 3600):02}:{int((end % 3600) // 60):02}:{int(end % 60):02},{int((end * 1000) % 1000):03}"
 
-        if w_box <= max_width:
-            current = test
-        else:
-            lines.append(current)
-            current = w
+            f.write(f"{i + 1}\n")
+            f.write(f"{start_str} --> {end_str}\n")
+            f.write(f"{text}\n\n")
 
-    if current:
-        lines.append(current)
-    return lines
+    return srt_path
 
 
 # ============================================
-# SUBTITLE IMAGE
+# BURN SUBTITLES (FFMPEG DIRECT - **מהיר**)
 # ============================================
-def create_subtitle_image(text, video_w, video_h):
-    fontsize = max(24, int(video_w / 34))
-    font = get_hebrew_font(fontsize)
+def burn_subtitles_fast(video_path, srt_path):
+    
+    out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+    font_name = os.path.basename(get_hebrew_font()) # קבלת השם 'NotoSansHebrew.ttf'
 
-    dummy = Image.new("RGBA", (10,10), (0,0,0,0))
-    draw = ImageDraw.Draw(dummy)
+    # הגדרות צריבה מלאות ל-libass (הכלי ש-FFMPEG משתמש בו לכתוביות מתקדמות)
+    # Alignment=2 (תחתון מרכז), Outline=2, PrimaryColour לבן.
+    # Fontname= משתמש בשם הקובץ שהועתק לתוך images/fontsdir ב-Dockerfile
+    style = f"Fontname={font_name}:PrimaryColour=&H00FFFFFF:OutlineColour=&H00000000:Outline=2:Shadow=0:Spacing=1.5:BorderStyle=3:Alignment=2"
 
-    max_width = int(video_w * 0.90)
-    lines = wrap_rtl(text, draw, font, max_width)
-
-    sizes = [draw.textbbox((0,0), line, font=font, stroke_width=2) for line in lines]
-    widths = [(x2-x1) for (x1,y1,x2,y2) in sizes]
-    heights = [(y2-y1) for (x1,y1,x2,y2) in sizes]
-
-    pad_x = 25
-    pad_y = 12
-
-    total_w = min(video_w - 40, max(widths) + pad_x * 2)
-    total_h = sum(heights) + pad_y*(len(lines)+1)
-
-    img = Image.new("RGBA", (total_w, total_h), (0,0,0,160))
-    draw2 = ImageDraw.Draw(img)
-
-    y = pad_y
-    for i, line in enumerate(lines):
-        lw = widths[i]
-        x = total_w - pad_x - lw
-
-        draw2.text(
-            (x, y),
-            line,
-            font=font,
-            fill=(255,255,255,255),
-            stroke_width=2,
-            stroke_fill=(0,0,0,255)
+    # FFMPEG מבצע את הצריבה והקידוד מחדש בבת אחת - הכי מהיר
+    try:
+        (
+            ffmpeg
+            .input(video_path)
+            .output(out_path, 
+                    vf=f"subtitles={srt_path}:force_style='{style}'",
+                    vcodec='libx264',
+                    acodec='aac',
+                    preset='ultrafast', # **המפתח למהירות: קידוד מהיר**
+                    crf=23 # איכות פלט טובה
+            )
+            .run(overwrite_output=True, quiet=True) # quiet=True מפחית פלט לקונסולה
         )
-        y += heights[i] + pad_y
+    except ffmpeg.Error as e:
+        # טיפול בשגיאות ffmpeg
+        error_message = e.stderr.decode('utf8')
+        raise RuntimeError(f"שגיאה בצריבת כתוביות (FFMPEG): {error_message}")
 
-    return img
-
-
-# ============================================
-# BURN SUBTITLES (SEGMENTED)
-# ============================================
-def burn_subtitles(video_path, segments, offset=1.8):  # ← כאן שונה ל־1.8
-
-    clip = VideoFileClip(video_path)
-    w, h = clip.w, clip.h
-
-    subtitle_clips = []
-
-    for seg in segments:
-        start = seg["start"] + offset
-        end   = seg["end"] + offset
-        text  = seg["text"]
-
-        img = create_subtitle_image(text, w, h)
-        img_np = np.array(img)
-
-        sub = (
-            ImageClip(img_np)
-            .set_start(max(0, start))
-            .set_duration(max(0.05, end - start))
-            .set_position(("center", h - img.height - 30))
-        )
-
-        subtitle_clips.append(sub)
-
-    final = CompositeVideoClip([clip] + subtitle_clips)
-
-    out = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
-    final.write_videofile(
-        out,
-        codec="libx264",
-        audio_codec="aac",
-        threads=2,
-        preset="ultrafast",
-        verbose=False
-    )
-
-    clip.close()
-    final.close()
-    return out
+    return out_path
 
 
 # ============================================
 # TELEGRAM HANDLER
 # ============================================
 def send_progress(chat_id, text):
+    """שולח הודעה למשתמש, עם טיפול בשגיאות."""
     try:
         bot.send_message(chat_id, text)
     except:
@@ -172,49 +124,77 @@ def start(msg):
 @bot.message_handler(content_types=["video"])
 def handle_video(message):
     chat = message.chat.id
+    temp_video_path = None
+    temp_audio_path = None
+    temp_srt_path = None
+    final_output_path = None
 
     try:
+        # --- 1. הורדה ובדיקת וידאו ---
         send_progress(chat, "📥 מוריד את הסרטון...")
         file_info = bot.get_file(message.video.file_id)
         url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_info.file_path}"
         data = requests.get(url).content
 
-        temp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-        temp.write(data)
-        temp.close()
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        temp_file.write(data)
+        temp_file.close()
+        temp_video_path = temp_file.name
 
-        clip = VideoFileClip(temp.name)
-        if clip.duration > 305:
+        # בדיקת אורך סרטון באמצעות FFMPEG (יותר מהיר מ-moviepy)
+        probe = ffmpeg.probe(temp_video_path)
+        duration = float(probe['format']['duration'])
+        if duration > 305:
             bot.send_message(chat, "❌ הסרטון ארוך מ־5 דקות.")
             return
-        clip.close()
 
-        send_progress(chat, "🎧 מפענח אודיו (כולל זמנים)...")
+        # --- 2. חילוץ אודיו (מהיר!) ושליחה ל-Groq ---
+        temp_audio_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3").name
+        
+        send_progress(chat, "🎶 מפיק אודיו ושולח ל-Groq API...")
 
-        resp = client.audio.transcriptions.create(
-            model="whisper-large-v3-turbo",
-            file=open(temp.name, "rb"),
-            response_format="verbose_json"
+        # חילוץ אודיו באמצעות FFMPEG (מהיר)
+        (
+            ffmpeg
+            .input(temp_video_path)
+            .output(temp_audio_path, vn=None, acodec='libmp3lame')
+            .run(overwrite_output=True, quiet=True)
         )
-
+        
+        # זיהוי דיבור ותרגום (רק של קובץ האודיו הקטן)
+        with open(temp_audio_path, "rb") as audio_file:
+            resp = client.audio.transcriptions.create(
+                model="whisper-large-v3-turbo",
+                file=audio_file, 
+                response_format="verbose_json"
+            )
+        
         segments = resp.segments
 
+        # --- 3. תרגום ויצירת SRT ---
         send_progress(chat, "🌍 מתרגם כל שורה...")
         for s in segments:
             s["text"] = translator.translate(s["text"])
+        
+        temp_srt_path = create_srt_file(segments, offset=1.8) 
 
-        send_progress(chat, "🔥 שורף כתוביות (offset 1.8s)...")
-        out_path = burn_subtitles(temp.name, segments, offset=1.8)  # ← כאן שונה ל־1.8
+        # --- 4. צריבת כתוביות (FFMPEG מהיר!) ושליחה ---
+        send_progress(chat, "🔥 שורף כתוביות (FFMPEG מהיר!)...")
+        final_output_path = burn_subtitles_fast(temp_video_path, temp_srt_path) 
 
         send_progress(chat, "📤 מעלה את הסרטון...")
-        with open(out_path, "rb") as f:
+        with open(final_output_path, "rb") as f:
             bot.send_video(chat, f, caption="✅ הנה הסרטון שלך!")
-
-        os.remove(temp.name)
-        os.remove(out_path)
 
     except Exception as e:
         bot.send_message(chat, f"❌ שגיאה: {e}\n{traceback.format_exc()}")
+    
+    finally:
+        # --- 5. ניקוי קבצים זמניים ---
+        files_to_remove = [temp_video_path, temp_audio_path, temp_srt_path, final_output_path]
+        for f in files_to_remove:
+            if f and os.path.exists(f):
+                os.remove(f)
 
 
 # ============================================
