@@ -133,7 +133,8 @@ def get_transcript_and_translation(audio_data):
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"תרגם לעברית: {original_text}"}
             ],
-            model="llama3-70b-8192", # Using the most powerful model for translation quality
+            # FIX: Changed the decommissioned model 'llama3-70b-8192' to the supported 'llama3-8b-8192'
+            model="llama3-8b-8192", 
             temperature=0.3
         )
         translated_text = translation_response.choices[0].message.content
@@ -190,7 +191,6 @@ def handle_video(message):
         (
             ffmpeg
             .input(temp_paths['video'])
-            # FIX: Changed b:'64k' to b='64k' to fix SyntaxError
             .output(temp_paths['audio'], acodec='libopus', b='64k') # Use opus for Groq compatibility
             .run(overwrite_output=True, quiet=True)
         )
