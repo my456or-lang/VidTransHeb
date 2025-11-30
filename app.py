@@ -68,7 +68,7 @@ def safe_send_error_message(chat_id, error_message, full_traceback=""):
         bot.send_message(chat_id, f"❌ שגיאה קריטית: לא ניתן לשלוח את פרטי השגיאה. (שגיאה: {e})")
 
 # FFMPEG Command: Subtitle burning and re-encoding
-# FIX 1: Removed 'PrimaryColour' which caused 'Option not found' in Render's FFMPEG build.
+# FIX: Uses simple, reliable subtitle settings
 def burn_subtitles_fast(input_path, subtitle_path, output_path):
     """
     Uses FFMPEG to burn subtitles into the video file using the 'subtitles' filter.
@@ -81,6 +81,7 @@ def burn_subtitles_fast(input_path, subtitle_path, output_path):
             .output(
                 output_path,
                 # Subtitles filter: using simple font parameters for maximum compatibility
+                # Fontname='Noto Sans Hebrew' is crucial for Hebrew support
                 vf=f"subtitles='{subtitle_path}':force_style='Fontname=Noto Sans Hebrew,FontSize=28,Alignment=10,Outline=2,Shadow=1,MarginV=40'",
                 vcodec='libx264',
                 acodec='copy',
@@ -189,7 +190,8 @@ def handle_video(message):
         (
             ffmpeg
             .input(temp_paths['video'])
-            .output(temp_paths['audio'], acodec='libopus', b:'64k') # Use opus for Groq compatibility
+            # FIX: Changed b:'64k' to b='64k' to fix SyntaxError
+            .output(temp_paths['audio'], acodec='libopus', b='64k') # Use opus for Groq compatibility
             .run(overwrite_output=True, quiet=True)
         )
         
@@ -209,11 +211,7 @@ def handle_video(message):
 
         # --- Stage 4: Create Subtitle File (SRT format) ---
         # Groq/Llama3 returns the full translated script. We need to format it into SRT.
-        # Since we don't have timestamps, we use the simple VTT format with the full script.
-        # For simplicity, we create a basic SRT file for FFMPEG to use.
-        # NOTE: A more advanced bot would use a dedicated STT tool to get timestamps.
         
-        # The FFMPEG 'subtitles' filter usually supports ASS files better, but a basic SRT works.
         temp_sub_file = tempfile.NamedTemporaryFile(suffix=".srt", mode="w", encoding="utf-8", delete=False)
         temp_paths['sub'] = temp_sub_file.name
         
@@ -245,7 +243,7 @@ def handle_video(message):
             )
 
     except Exception as e:
-        # FIX 2: Send a safe, truncated error message
+        # Send a safe, truncated error message
         print(f"General Error: {e}")
         safe_send_error_message(
             chat, 
