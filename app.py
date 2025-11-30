@@ -125,7 +125,7 @@ def get_transcript_and_translation(audio_data):
         if not original_text:
             return None, "לא נמצא טקסט לשעתוק."
 
-        # 2. Translate the transcript to Hebrew using Llama3
+        # 2. Translate the transcript to Hebrew using a supported Groq model
         system_prompt = "אתה מתרגם מקצועי לאנגלית-עברית. תרגם את הטקסט הבא לעברית טבעית ורהוטה, תוך שמירה על הנימה והמשמעות המקורית."
         
         translation_response = groq_client.chat.completions.create(
@@ -133,8 +133,8 @@ def get_transcript_and_translation(audio_data):
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"תרגם לעברית: {original_text}"}
             ],
-            # FIX: Changed the decommissioned model 'llama3-70b-8192' to the supported 'llama3-8b-8192'
-            model="llama3-8b-8192", 
+            # FIX 2: Changed the decommissioned model 'llama3-8b-8192' to the supported 'gemma2-9b-it'
+            model="gemma2-9b-it", 
             temperature=0.3
         )
         translated_text = translation_response.choices[0].message.content
