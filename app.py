@@ -133,8 +133,8 @@ def get_transcript_and_translation(audio_data):
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"תרגם לעברית: {original_text}"}
             ],
-            # FIX 2: Changed the decommissioned model 'llama3-8b-8192' to the supported 'gemma2-9b-it'
-            model="gemma2-9b-it", 
+            # FIX 3: Returning to the powerful 'llama3-70b-8192' hoping it has stabilized or reactivated.
+            model="llama3-70b-8192", 
             temperature=0.3
         )
         translated_text = translation_response.choices[0].message.content
