@@ -7,9 +7,9 @@ from flask import Flask
 import telebot
 from groq import Groq
 from deep_translator import GoogleTranslator
-# מהייבוא של moviepy/PIL נשאר רק מה שדרוש לטעינת הגופן
+import ffmpeg 
 from PIL import ImageFont
-import ffmpeg # **חדש: נדרש לחילוץ אודיו וצריבה מהירה**
+
 
 # ============================================
 # ENV
@@ -28,9 +28,14 @@ translator = GoogleTranslator(source="auto", target="iw")
 
 app = Flask(__name__)
 
+# ============================================
+# FLASK ENDPOINTS (רק לבדיקת תקינות השירות)
+# ============================================
+
 @app.route("/")
 def home():
-    return "Telegram Hebrew Subtitle Bot — Running ✅"
+    # פונקציה זו מאפשרת ל-Render לדעת שהשירות חי ופועל
+    return "Telegram Hebrew Subtitle Bot — Running (Polling) ✅"
 
 
 # ============================================
@@ -40,14 +45,12 @@ def get_hebrew_font(size=48):
     """מחזיר נתיב לגופן העברי."""
     font_path = "fonts/NotoSansHebrew.ttf"
     if os.path.exists(font_path):
-        # במקרה של הרצה מקומית
         return font_path 
-    # עבור סביבות דוקר/רנדר שבהן הנתיב מוגדר ב-Dockerfile
     return "NotoSansHebrew.ttf" 
 
 
 # ============================================
-# CREATE SRT FILE (משתמש בלוגיקת ה-segments הקיימת)
+# CREATE SRT FILE (נשאר זהה)
 # ============================================
 def create_srt_file(segments, offset=1.8):
     """יוצר קובץ SRT מקטעי התרגום."""
@@ -71,19 +74,15 @@ def create_srt_file(segments, offset=1.8):
 
 
 # ============================================
-# BURN SUBTITLES (FFMPEG DIRECT - **מהיר**)
+# BURN SUBTITLES (FFMPEG DIRECT - מהיר, נשאר זהה)
 # ============================================
 def burn_subtitles_fast(video_path, srt_path):
     
     out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
-    font_name = os.path.basename(get_hebrew_font()) # קבלת השם 'NotoSansHebrew.ttf'
+    font_name = os.path.basename(get_hebrew_font()) 
 
-    # הגדרות צריבה מלאות ל-libass (הכלי ש-FFMPEG משתמש בו לכתוביות מתקדמות)
-    # Alignment=2 (תחתון מרכז), Outline=2, PrimaryColour לבן.
-    # Fontname= משתמש בשם הקובץ שהועתק לתוך images/fontsdir ב-Dockerfile
     style = f"Fontname={font_name}:PrimaryColour=&H00FFFFFF:OutlineColour=&H00000000:Outline=2:Shadow=0:Spacing=1.5:BorderStyle=3:Alignment=2"
 
-    # FFMPEG מבצע את הצריבה והקידוד מחדש בבת אחת - הכי מהיר
     try:
         (
             ffmpeg
@@ -92,13 +91,12 @@ def burn_subtitles_fast(video_path, srt_path):
                     vf=f"subtitles={srt_path}:force_style='{style}'",
                     vcodec='libx264',
                     acodec='aac',
-                    preset='ultrafast', # **המפתח למהירות: קידוד מהיר**
-                    crf=23 # איכות פלט טובה
+                    preset='ultrafast', 
+                    crf=23 
             )
-            .run(overwrite_output=True, quiet=True) # quiet=True מפחית פלט לקונסולה
+            .run(overwrite_output=True, quiet=True) 
         )
     except ffmpeg.Error as e:
-        # טיפול בשגיאות ffmpeg
         error_message = e.stderr.decode('utf8')
         raise RuntimeError(f"שגיאה בצריבת כתוביות (FFMPEG): {error_message}")
 
@@ -106,7 +104,7 @@ def burn_subtitles_fast(video_path, srt_path):
 
 
 # ============================================
-# TELEGRAM HANDLER
+# TELEGRAM HANDLER (נשאר זהה)
 # ============================================
 def send_progress(chat_id, text):
     """שולח הודעה למשתמש, עם טיפול בשגיאות."""
@@ -123,6 +121,7 @@ def start(msg):
 
 @bot.message_handler(content_types=["video"])
 def handle_video(message):
+    # [הלוגיקה הפנימית נשארת זהה לחלוטין]
     chat = message.chat.id
     temp_video_path = None
     temp_audio_path = None
@@ -141,14 +140,14 @@ def handle_video(message):
         temp_file.close()
         temp_video_path = temp_file.name
 
-        # בדיקת אורך סרטון באמצעות FFMPEG (יותר מהיר מ-moviepy)
+        # בדיקת אורך סרטון באמצעות FFMPEG
         probe = ffmpeg.probe(temp_video_path)
         duration = float(probe['format']['duration'])
         if duration > 305:
             bot.send_message(chat, "❌ הסרטון ארוך מ־5 דקות.")
             return
 
-        # --- 2. חילוץ אודיו (מהיר!) ושליחה ל-Groq ---
+        # --- 2. חילוץ אודיו ושליחה ל-Groq ---
         temp_audio_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3").name
         
         send_progress(chat, "🎶 מפיק אודיו ושולח ל-Groq API...")
@@ -161,7 +160,7 @@ def handle_video(message):
             .run(overwrite_output=True, quiet=True)
         )
         
-        # זיהוי דיבור ותרגום (רק של קובץ האודיו הקטן)
+        # זיהוי דיבור ותרגום
         with open(temp_audio_path, "rb") as audio_file:
             resp = client.audio.transcriptions.create(
                 model="whisper-large-v3-turbo",
@@ -201,9 +200,16 @@ def handle_video(message):
 # RUN
 # ============================================
 def run_bot():
+    # Polling רגיל - זהו התהליך שייכשל אם יופעל פעמיים
+    print("TeleBot Polling מתחיל...")
     bot.infinity_polling(timeout=60, long_polling_timeout=60)
 
 
 if __name__ == "__main__":
-    threading.Thread(target=run_bot, daemon=True).start()
+    # **הרצת ה-Polling ב-Thread נפרד**
+    polling_thread = threading.Thread(target=run_bot, daemon=True)
+    polling_thread.start()
+    
+    # **הרצת שרת Flask על התהליך הראשי**
+    print("Flask Server מתחיל...")
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
