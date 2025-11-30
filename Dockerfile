@@ -20,6 +20,6 @@ COPY fonts/ /app/fonts/
 # **חשוב:** רענון מטמון הגופנים כדי ש-libass/ffmpeg יזהו את הגופן המותאם אישית
 RUN fc-cache -f -v
 
-EXPOSE 8080
+EXPOSE 10000
 
 CMD ["python", "app.py"]
