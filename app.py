@@ -22,7 +22,7 @@ load_dotenv()
 BOT_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 GROQ_API_KEY = os.environ.get('GROQ_API_KEY')
 ADMIN_USER_ID = os.environ.get('ADMIN_USER_ID') # Optional: For admin alerts
-FFMPEG_TIMEOUT = 300 # 5 minutes timeout for FFMPEG
+FFMPEG_TIMEOUT = 300 # 5 minutes timeout for FFMPEG (No longer used directly in run())
 
 # Initialize Clients
 try:
@@ -89,7 +89,8 @@ def burn_subtitles_fast(input_path, subtitle_path, output_path):
                 strict='experimental' # Allows non-standard features if needed
             )
             .global_args('-t', '300') # Hard limit of 5 minutes (300 seconds)
-            .run(overwrite_output=True, quiet=True, capture_stdout=True, capture_stderr=True, timeout=FFMPEG_TIMEOUT)
+            # FIX: Removed 'timeout=FFMPEG_TIMEOUT' as it causes TypeError in the Render environment.
+            .run(overwrite_output=True, quiet=True, capture_stdout=True, capture_stderr=True)
         )
         return True
     except ffmpeg.Error as e:
@@ -140,6 +141,7 @@ def get_transcript_and_translation(audio_data):
     
     # Catching Groq API errors specifically, although they should be avoided now.
     except Exception as e:
+         # Changed to RuntimeError to be consistent with FFMPEG error handling
          raise RuntimeError(f"Groq/Whisper API call failed during transcription/translation. Error: {e}")
     
     finally:
@@ -235,7 +237,7 @@ def handle_video(message):
         temp_output_file.close()
         temp_paths['output'] = temp_output_file.name
         
-        # Call the fixed FFMPEG function
+        # Call the fixed FFMPEG function (now without the unsupported 'timeout' argument)
         burn_subtitles_fast(temp_paths['video'], temp_paths['sub'], temp_paths['output'])
 
         bot.send_message(chat, "4/4. 🎥 צריבת הכתוביות הסתיימה! שולח את הוידאו...")
