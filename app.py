@@ -68,11 +68,9 @@ def safe_send_error_message(chat_id, error_message, full_traceback=""):
         bot.send_message(chat_id, f"❌ שגיאה קריטית: לא ניתן לשלוח את פרטי השגיאה. (שגיאה: {e})")
 
 # FFMPEG Command: Subtitle burning and re-encoding
-# FIX: Uses simple, reliable subtitle settings
 def burn_subtitles_fast(input_path, subtitle_path, output_path):
     """
     Uses FFMPEG to burn subtitles into the video file using the 'subtitles' filter.
-    The video is re-encoded using the very fast 'ultrafast' preset with H.264 codec.
     """
     try:
         (
@@ -100,10 +98,11 @@ def burn_subtitles_fast(input_path, subtitle_path, output_path):
     except Exception as e:
         raise e
 
-# Groq Transcription and Translation
+# Groq Transcription and Translation (Using Whisper only)
 def get_transcript_and_translation(audio_data):
     """
-    Transcribes audio using Groq Whisper and translates it to Hebrew.
+    Transcribes audio to English and translates the audio directly to Hebrew
+    using two separate calls to the Whisper model (to avoid complex SRT parsing).
     """
     # Create a temporary file to hold the audio data
     with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as temp_audio_file:
@@ -111,35 +110,37 @@ def get_transcript_and_translation(audio_data):
         temp_audio_file_name = temp_audio_file.name
 
     try:
-        # 1. Transcribe the audio file
+        # 1. Transcribe the audio file to ENGLISH (to get the original text for the caption)
         with open(temp_audio_file_name, "rb") as audio_file:
-            # We use the 'whisper-large-v3' model provided by Groq
             transcript_response = groq_client.audio.transcriptions.create(
                 file=(temp_audio_file_name, audio_file.read()),
                 model="whisper-large-v3",
                 response_format="json",
-                language="en" # Assuming the source video is English
+                language="en" # Source language assumption
             )
             original_text = transcript_response.text
 
         if not original_text:
             return None, "לא נמצא טקסט לשעתוק."
 
-        # 2. Translate the transcript to Hebrew using a supported Groq model
-        system_prompt = "אתה מתרגם מקצועי לאנגלית-עברית. תרגם את הטקסט הבא לעברית טבעית ורהוטה, תוך שמירה על הנימה והמשמעות המקורית."
-        
-        translation_response = groq_client.chat.completions.create(
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"תרגם לעברית: {original_text}"}
-            ],
-            # FIX 3: Returning to the powerful 'llama3-70b-8192' hoping it has stabilized or reactivated.
-            model="llama3-70b-8192", 
-            temperature=0.3
-        )
-        translated_text = translation_response.choices[0].message.content
+        # 2. Translate the audio file directly to HEBREW using Whisper
+        # We must reopen the file stream for the second API call
+        with open(temp_audio_file_name, "rb") as audio_file:
+            translation_response = groq_client.audio.translations.create(
+                file=(temp_audio_file_name, audio_file.read()),
+                model="whisper-large-v3",
+                response_format="json",
+                # The prompt guides Whisper to output the translation in the target language (Hebrew)
+                prompt="Translate the content into formal Hebrew." 
+            )
+            # Whisper translation returns the translated text directly
+            translated_text = translation_response.text
         
         return original_text, translated_text
+    
+    # Catching Groq API errors specifically, although they should be avoided now.
+    except Exception as e:
+         raise RuntimeError(f"Groq/Whisper API call failed during transcription/translation. Error: {e}")
     
     finally:
         # Clean up the temporary audio file
@@ -195,22 +196,28 @@ def handle_video(message):
             .run(overwrite_output=True, quiet=True)
         )
         
-        bot.send_message(chat, "2/4. 🎤 אודיו הופק בהצלחה. מתחיל שעתוק ותרגום (Groq)...")
+        # We must ensure the audio file is correctly created and has content
+        if os.path.getsize(temp_paths['audio']) < 1000:
+             bot.send_message(chat, "❌ לא הצלחתי להפיק אודיו מהסרטון, או שקובץ האודיו קטן מדי.")
+             return
+             
+        bot.send_message(chat, "2/4. 🎤 אודיו הופק בהצלחה. מתחיל שעתוק ותרגום (Whisper)...")
         
-        # --- Stage 3: Transcription and Translation (Groq) ---
+        # --- Stage 3: Transcription and Translation (Whisper Only) ---
         with open(temp_paths['audio'], "rb") as f:
             audio_bytes = f.read()
         
+        # Calling the updated function
         original_text, translated_text = get_transcript_and_translation(audio_bytes)
 
-        if not translated_text or translated_text.lower().strip() == "לא נמצא טקסט לשעתוק.":
-            bot.send_message(chat, "❌ לא הצלחתי לזהות אודיו ברור או שלא נמצא טקסט לשעתוק.")
+        if not translated_text:
+            bot.send_message(chat, "❌ לא הצלחתי לזהות אודיו ברור או שלא נמצא טקסט לתרגום.")
             return
 
         bot.send_message(chat, "3/4. 📝 התרגום הושלם! מתחיל צריבת כתוביות לוידאו...")
 
         # --- Stage 4: Create Subtitle File (SRT format) ---
-        # Groq/Llama3 returns the full translated script. We need to format it into SRT.
+        # Whisper translation returns the full translated script. We use a single SRT block.
         
         temp_sub_file = tempfile.NamedTemporaryFile(suffix=".srt", mode="w", encoding="utf-8", delete=False)
         temp_paths['sub'] = temp_sub_file.name
@@ -234,20 +241,24 @@ def handle_video(message):
         bot.send_message(chat, "4/4. 🎥 צריבת הכתוביות הסתיימה! שולח את הוידאו...")
 
         # --- Stage 6: Send the Result ---
+        # Shorten original text for caption
+        caption_original = original_text[:100] + "..." if len(original_text) > 100 else original_text
+        
         with open(temp_paths['output'], 'rb') as final_video:
             bot.send_video(
                 chat, 
                 final_video, 
-                caption=f"✅ סרטון מתורגם לעברית באמצעות Groq.\n\nהטקסט המקורי: {original_text[:100]}...",
+                caption=f"✅ סרטון מתורגם לעברית באמצעות Groq Whisper.\n\nהטקסט המקורי: {caption_original}",
                 supports_streaming=True
             )
 
     except Exception as e:
         # Send a safe, truncated error message
-        print(f"General Error: {e}")
+        error_type = type(e).__name__
+        print(f"General Error: {error_type} - {e}")
         safe_send_error_message(
             chat, 
-            "אירעה שגיאה קריטית במהלך העיבוד. בדוק את הטוקנים ואת הלוגים של Render.",
+            f"אירעה שגיאה קריטית במהלך העיבוד ({error_type}).",
             traceback.format_exc()
         )
 
