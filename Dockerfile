@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+טּFROM python:3.11-slim
 
 WORKDIR /app
 
@@ -19,4 +19,4 @@ COPY fonts/ /app/fonts/
 
 EXPOSE 8080
 
-CMD ["python", "app.py"]
+CMD ["gunicorn", "-w", "4", "-b", "0.0.0.0:8080", "app:app"]
