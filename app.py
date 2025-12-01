@@ -113,7 +113,7 @@ def create_subtitle_image(text, video_w, video_h):
 # ============================================
 # BURN SUBTITLES (SEGMENTED)
 # ============================================
-def burn_subtitles(video_path, segments, offset=0):  
+def burn_subtitles(video_path, segments, offset=0):
 
     clip = VideoFileClip(video_path)
     w, h = clip.w, clip.h
@@ -121,8 +121,8 @@ def burn_subtitles(video_path, segments, offset=0):
     subtitle_clips = []
 
     for seg in segments:
-        start = seg["start"] + offset
-        end   = seg["end"] + offset
+        start = seg["start"]
+        end   = seg["end"] 
         text  = seg["text"]
 
         img = create_subtitle_image(text, w, h)
@@ -230,6 +230,7 @@ def handle_video(message):
 
         # 5. שריפת כתוביות
         send_progress(chat, "🔥 שורף כתוביות (ללא קיזוז)...")
+        
         try:
             out_path = burn_subtitles(temp.name, segments, offset=0)
         except Exception as e:
@@ -260,9 +261,9 @@ def handle_video(message):
 # RUN
 # ============================================
 def run_bot():
-    bot.infinity_polling(timeout=60, long_polling_timeout=60)
+    # הגדלת ה-timeout ליציבות עם Gunicorn
+    bot.infinity_polling(timeout=90, long_polling_timeout=90)
 
 
-if __name__ == "__main__":
-    threading.Thread(target=run_bot, daemon=True).start()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+# Gunicorn יפעיל את שרת ה-Flask 'app', וה-thread הזה יפעיל את הבוט.
+threading.Thread(target=run_bot, daemon=True).start()
