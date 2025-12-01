@@ -1,390 +1,268 @@
 import os
-import io
-import time
+import threading
 import tempfile
 import traceback
-import threading
-import re
-import json # Import for JSON parsing
-import html # Import for HTML escaping the traceback
-from dotenv import load_dotenv
-
-# Import for Telegram and Flask
+import requests
+from flask import Flask
 import telebot
-from flask import Flask, request
-
-# Import for FFMPEG (Video processing) and Groq (Transcription/LLM)
-import ffmpeg
 from groq import Groq
-from groq.types.chat import ChatCompletion
+from deep_translator import GoogleTranslator
+from moviepy.editor import VideoFileClip, CompositeVideoClip, ImageClip
+from PIL import Image, ImageDraw, ImageFont
+import numpy as np
 
-# Load environment variables (used for local testing, Render uses its own Environment variables)
-load_dotenv()
+# ============================================
+# ENV
+# ============================================
+BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
-# --- Configuration ---
-BOT_TOKEN = os.environ.get('TELEGRAM_TOKEN')
-GROQ_API_KEY = os.environ.get('GROQ_API_KEY')
-ADMIN_USER_ID = os.environ.get('ADMIN_USER_ID') # Optional: For admin alerts
-FFMPEG_TIMEOUT = 300 # 5 minutes timeout for FFMPEG 
-# CRITICAL FIX: The previous model llama3-70b-8192 has been decommissioned. 
-# Swapping to the current, supported Llama 3.1 model for translation.
-LLM_MODEL = "llama3.1-8b-8192" 
+if not BOT_TOKEN:
+    raise RuntimeError("TELEGRAM_TOKEN לא מוגדר")
+if not GROQ_API_KEY:
+    raise RuntimeError("GROQ_API_KEY לא מוגדר")
 
-# Initialize Clients
-try:
-    # Use parse_mode='HTML' for better formatting
-    bot = telebot.TeleBot(BOT_TOKEN, parse_mode='HTML')
-    groq_client = Groq(api_key=GROQ_API_KEY)
-except ValueError as e:
-    print(f"FATAL ERROR: Failed to initialize TeleBot. Error: {e}")
-    exit(1)
-except Exception as e:
-    print(f"FATAL ERROR: Failed to initialize clients. Check environment variables. Error: {e}")
-    exit(1)
+bot = telebot.TeleBot(BOT_TOKEN)
+client = Groq(api_key=GROQ_API_KEY)
+translator = GoogleTranslator(source="auto", target="iw")
 
-# Initialize Flask App
 app = Flask(__name__)
 
-# --- Helper Functions ---
+@app.route("/")
+def home():
+    return "Telegram Hebrew Subtitle Bot — Running ✅"
 
-def safe_send_error_message(chat_id, error_message, full_traceback=""):
-    """
-    Sends an error message to the user, ensuring the text does not exceed 4096 characters.
-    The traceback is HTML-escaped to prevent Telegram's parser from misinterpreting code snippets 
-    (like <listcomp>) as invalid HTML tags.
-    """
-    full_message = f"❌ <b>שגיאה קריטית:</b> {error_message}\n\n"
-    
-    if full_traceback:
-        MAX_TRACEBACK_LEN = 3000
-        
-        if len(full_traceback) > MAX_TRACEBACK_LEN:
-            full_traceback = full_traceback[:MAX_TRACEBACK_LEN] + "\n... [המשך השגיאה קוצץ] ..."
-        
-        # CRITICAL FIX: Escape HTML characters in the traceback to prevent Telegram from misinterpreting them.
-        escaped_traceback = html.escape(full_traceback)
-        
-        full_message += f"<u>פרטים טכניים:</u>\n<pre>{escaped_traceback}</pre>"
-    
-    try:
-        # Use HTML parse mode for better formatting and code block support
-        bot.send_message(chat_id, full_message, parse_mode='HTML')
-    except telebot.apihelper.ApiTelegramException as e:
-        # Fallback if even the error sending fails (e.g., due to extreme length or other API issues)
-        bot.send_message(chat_id, f"❌ שגיאה קריטית: לא ניתן לשלוח את פרטי השגיאה. (שגיאה: {e})")
 
-# FFMPEG Command: Subtitle burning and re-encoding
-def burn_subtitles_fast(input_path, subtitle_path, output_path):
-    """
-    Uses FFMPEG to burn subtitles into the video file using the 'subtitles' filter.
-    Alignment=2 (Bottom Center) for subtitles.
-    """
-    try:
-        (
-            ffmpeg
-            .input(input_path)
-            .output(
-                output_path,
-                # Alignment=2 sets subtitles to the bottom center (default is 10)
-                # MarginV=20 sets padding from the bottom edge
-                vf=f"subtitles='{subtitle_path}':force_style='Fontname=Noto Sans Hebrew,FontSize=28,Alignment=2,Outline=2,Shadow=1,MarginV=20'",
-                vcodec='libx264',
-                acodec='copy',
-                pix_fmt='yuv420p',
-                preset='ultrafast',  # Fast encoding speed
-                crf=23, # Default quality for H.264
-                strict='experimental'
-            )
-            .global_args('-t', '300') # Hard limit of 5 minutes (300 seconds)
-            .run(overwrite_output=True, quiet=True, capture_stdout=True, capture_stderr=True)
+# ============================================
+# FONT
+# ============================================
+def get_hebrew_font(size=48):
+    font_path = "fonts/NotoSansHebrew.ttf"
+    if os.path.exists(font_path):
+        return ImageFont.truetype(font_path, size)
+    return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", size)
+
+
+# ============================================
+# WRAP RTL TEXT
+# ============================================
+def wrap_rtl(text, draw, font, max_width):
+    words = text.split()
+    lines = []
+    current = ""
+
+    for w in words:
+        test = w if not current else current + " " + w
+        w_box = draw.textbbox((0,0), test, font=font, stroke_width=2)[2]
+
+        if w_box <= max_width:
+            current = test
+        else:
+            lines.append(current)
+            current = w
+
+    if current:
+        lines.append(current)
+    return lines
+
+
+# ============================================
+# SUBTITLE IMAGE
+# ============================================
+def create_subtitle_image(text, video_w, video_h):
+    fontsize = max(24, int(video_w / 34))
+    font = get_hebrew_font(fontsize)
+
+    dummy = Image.new("RGBA", (10,10), (0,0,0,0))
+    draw = ImageDraw.Draw(dummy)
+
+    max_width = int(video_w * 0.90)
+    lines = wrap_rtl(text, draw, font, max_width)
+
+    sizes = [draw.textbbox((0,0), line, font=font, stroke_width=2) for line in lines]
+    widths = [(x2-x1) for (x1,y1,x2,y2) in sizes]
+    heights = [(y2-y1) for (x1,y1,x2,y2) in sizes]
+
+    pad_x = 25
+    pad_y = 12
+
+    total_w = min(video_w - 40, max(widths) + pad_x * 2)
+    total_h = sum(heights) + pad_y*(len(lines)+1)
+
+    img = Image.new("RGBA", (total_w, total_h), (0,0,0,160))
+    draw2 = ImageDraw.Draw(img)
+
+    y = pad_y
+    for i, line in enumerate(lines):
+        lw = widths[i]
+        x = total_w - pad_x - lw
+
+        draw2.text(
+            (x, y),
+            line,
+            font=font,
+            fill=(255,255,255,255),
+            stroke_width=2,
+            stroke_fill=(0,0,0,255)
         )
-        return True
-    except ffmpeg.Error as e:
-        raise RuntimeError(f"FFMPEG Encoding Failed. Stderr: {e.stderr.decode('utf8', errors='ignore')}")
-    except Exception as e:
-        raise e
+        y += heights[i] + pad_y
 
-def convert_seconds_to_srt_time(seconds):
-    """Converts a floating-point number of seconds to SRT time format: HH:MM:SS,mmm"""
-    hours = int(seconds // 3600)
-    minutes = int((seconds % 3600) // 60)
-    remaining_seconds = seconds % 60
-    milliseconds = int((remaining_seconds - int(remaining_seconds)) * 1000)
-    
-    return f"{hours:02}:{minutes:02}:{int(remaining_seconds):02},{milliseconds:03}"
+    return img
 
-def generate_new_srt(translated_segments):
-    """
-    Generates a new SRT string from the translated segments.
-    Each segment contains 'start', 'end' (in seconds), and 'text' (Hebrew).
-    """
-    new_srt = ""
-    for i, segment in enumerate(translated_segments):
-        start_time = convert_seconds_to_srt_time(segment['start'])
-        end_time = convert_seconds_to_srt_time(segment['end'])
-        
-        new_srt += f"{i + 1}\n"
-        new_srt += f"{start_time} --> {end_time}\n"
-        new_srt += f"{segment['text']}\n\n"
-        
-    return new_srt.strip()
 
-def get_transcript_and_translation(audio_data):
-    """
-    1. Transcribes audio to verbose_json (to get time synchronization).
-    2. Uses Groq LLM to translate the full transcript to Hebrew.
-    3. Rebuilds the segments with the Hebrew translation.
-    Returns: original_text (str), translated_srt_content (str)
-    """
-    # Create a temporary file to hold the audio data
-    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as temp_audio_file:
-        temp_audio_file.write(audio_data)
-        temp_audio_file_name = temp_audio_file.name
+# ============================================
+# BURN SUBTITLES (SEGMENTED)
+# ============================================
+def burn_subtitles(video_path, segments, offset=1.8):  # ← כאן שונה ל־1.8
 
-    try:
-        # --- 1. Transcription to Verbose JSON (for sync) ---
-        with open(temp_audio_file_name, "rb") as audio_file:
-            transcript_response_json = groq_client.audio.transcriptions.create(
-                file=(temp_audio_file_name, audio_file.read()),
-                model="whisper-large-v3",
-                response_format="verbose_json"
-                # Whisper will auto-detect the language
-            )
-            
-        # transcript_response_json is the outer Groq object (with .text and .segments)
-        original_segments = transcript_response_json.segments
-        
-        # Check if the segments list is empty
-        if not original_segments:
-             raise RuntimeError("Whisper did not return valid segments for synchronization.")
-             
-        original_text = transcript_response_json.text
-        
-        # --- 2. Translation using Groq LLM ---
-        
-        # System instruction to guide the LLM's output - language agnostic translation to HEBREW.
-        system_prompt = "You are a professional subtitle translator. Your task is to translate a large block of text that has been segmented into subtitle-length chunks. Translate the following list of segments into high-quality, clear, and colloquial Hebrew. The source language is determined by the input text. The output MUST be a valid JSON array, where each element is a string containing the Hebrew translation for the corresponding segment. The output MUST ONLY contain the JSON array, nothing else."
+    clip = VideoFileClip(video_path)
+    w, h = clip.w, clip.h
 
-        # Access the segment text using dictionary keys ('text')
-        original_segment_texts = [s['text'].strip() for s in original_segments]
-        
-        # Updated user query to be language agnostic
-        user_query = f"Translate the following array of segments into Hebrew. Provide the output as a JSON array of strings:\n\n{json.dumps(original_segment_texts, ensure_ascii=False)}"
-        
-        # Use the updated LLM model
-        translation_response = groq_client.chat.completions.create(
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_query}
-            ],
-            model=LLM_MODEL,
-            temperature=0.1
+    subtitle_clips = []
+
+    for seg in segments:
+        start = seg["start"] + offset
+        end   = seg["end"] + offset
+        text  = seg["text"]
+
+        img = create_subtitle_image(text, w, h)
+        img_np = np.array(img)
+
+        sub = (
+            ImageClip(img_np)
+            .set_start(max(0, start))
+            .set_duration(max(0.05, end - start))
+            .set_position(("center", h - img.height - 30))
         )
-        
-        # Extract the JSON string from the LLM response
-        translated_json_string = translation_response.choices[0].message.content.strip()
 
-        # Clean up the JSON string (LLMs sometimes add ```json and extra text)
-        translated_json_string = re.sub(r"```json|```", "", translated_json_string, flags=re.IGNORECASE).strip()
-        
-        # Parse the JSON array
-        translated_texts = json.loads(translated_json_string)
-        
-        if len(translated_texts) != len(original_segments):
-             raise RuntimeError(f"Translation segments mismatch: Expected {len(original_segments)} translations but got {len(translated_texts)}.")
+        subtitle_clips.append(sub)
 
-        # --- 3. Rebuild the Segments with Hebrew Text ---
-        
-        final_segments = []
-        for i, original_segment in enumerate(original_segments):
-            final_segments.append({
-                'start': original_segment['start'], # Time in seconds (float) - Access using key
-                'end': original_segment['end'],   # Time in seconds (float) - Access using key
-                'text': translated_texts[i]    # Translated Hebrew text (str)
-            })
+    final = CompositeVideoClip([clip] + subtitle_clips)
 
-        # Generate the final SRT file content with Hebrew text and correct timings
-        final_translated_srt = generate_new_srt(final_segments)
-        
-        return original_text, final_translated_srt
-    
-    except json.JSONDecodeError as e:
-        # Include a snippet of the raw output for debugging JSON issues
-        raw_output_snippet = translated_json_string[:500] if 'translated_json_string' in locals() else "N/A"
-        raise RuntimeError(f"LLM translation failed to return clean JSON output for parsing. Error: {e} - Raw LLM Output: {raw_output_snippet}...")
-    except Exception as e:
-         # Catch Groq's BadRequestError and re-raise it nicely
-         raise RuntimeError(f"Groq API call failed during processing. Error: {e}")
-    
-    finally:
-        # Clean up the temporary audio file
-        if 'temp_audio_file_name' in locals() and os.path.exists(temp_audio_file_name):
-            os.unlink(temp_audio_file_name)
-
-
-# --- Telegram Handlers ---
-
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    """Handles the /start command and introduces the bot."""
-    welcome_message = (
-        "👋 שלום! אני הבוט של VidTransHeb.\n"
-        "שלח לי סרטון (עד 5 דקות) ואני אשתקף ואתרגם את הכתוביות שלו לעברית, ואצרב אותן לוידאו.\n\n"
-        "⏳ אנא המתן בסבלנות בזמן העיבוד, זה לוקח דקה או שתיים."
+    out = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+    final.write_videofile(
+        out,
+        codec="libx264",
+        audio_codec="aac",
+        threads=2,
+        preset="ultrafast",
+        verbose=False
     )
-    bot.send_message(message.chat.id, welcome_message)
 
-@bot.message_handler(content_types=['video'])
-def handle_video(message):
-    """Handles incoming video files."""
-    chat = message.chat.id
-    
-    # 1. Basic checks
-    if message.video.duration > 300: # Check the 5 minute limit
-        bot.send_message(chat, "❌ השגיאה: הסרטון ארוך מדי! אנא שלח סרטון של עד 5 דקות (300 שניות).")
-        return
+    clip.close()
+    final.close()
+    return out
 
-    # 2. Get the video file details
-    file_info = bot.get_file(message.video.file_id)
-    
-    # Send acknowledgment immediately to avoid Telegram timeout
-    ack_msg = bot.send_message(chat, "1/4. 📥 הסרטון התקבל. מפיק אודיו...")
-    
-    downloaded_file = bot.download_file(file_info.file_path)
 
-    temp_paths = {} # Dictionary to store temp file paths for cleanup
-    
+# ============================================
+# TELEGRAM HANDLER
+# ============================================
+def send_progress(chat_id, text):
     try:
-        # --- Stage 1: Save Video to Temp File ---
-        temp_video_file = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
-        temp_video_file.write(downloaded_file)
-        temp_video_file.close()
-        temp_paths['video'] = temp_video_file.name
-        
-        # --- Stage 2: Extract Audio from Video ---
-        temp_audio_file = tempfile.NamedTemporaryFile(suffix=".ogg", delete=False)
-        temp_audio_file.close()
-        temp_paths['audio'] = temp_audio_file.name
-        
-        # Use FFMPEG to extract audio stream
-        (
-            ffmpeg
-            .input(temp_paths['video'])
-            .output(temp_paths['audio'], acodec='libopus', b='64k') # Use opus for Groq compatibility
-            .run(overwrite_output=True, quiet=True)
-        )
-        
-        if os.path.getsize(temp_paths['audio']) < 1000:
-             bot.edit_message_text("❌ לא הצלחתי להפיק אודיו מהסרטון, או שקובץ האודיו קטן מדי.", chat, ack_msg.message_id)
-             return
-             
-        bot.edit_message_text("2/4. 🎤 אודיו הופק בהצלחה. מתחיל שעתוק, תרגום (LLM) וסנכרון...", chat, ack_msg.message_id)
-        
-        # --- Stage 3: Transcription and Translation (Whisper Verbose JSON + LLM) ---
-        with open(temp_paths['audio'], "rb") as f:
-            audio_bytes = f.read()
-        
-        # original_text is the full transcript, final_translated_srt is the full SRT file content (Hebrew, synchronized)
-        original_text, final_translated_srt = get_transcript_and_translation(audio_bytes)
+        bot.send_message(chat_id, text)
+    except:
+        pass
 
-        if not final_translated_srt:
-            bot.edit_message_text("❌ לא הצלחתי לזהות אודיו ברור או שלא נמצא טקסט לתרגום.", chat, ack_msg.message_id)
+
+@bot.message_handler(commands=["start"])
+def start(msg):
+    bot.reply_to(msg, "🎬 שלח סרטון עד 5 דקות ואחזיר אותו עם כתוביות בעברית — מסונכרנות!")
+
+
+@bot.message_handler(content_types=["video"])
+def handle_video(message):
+    chat = message.chat.id
+    temp = None
+    out_path = None
+
+    try:
+        # 1. הורדת הסרטון
+        send_progress(chat, "📥 מוריד את הסרטון...")
+        
+        file_info = bot.get_file(message.video.file_id)
+        if file_info.file_size is not None and file_info.file_size > 50 * 1024 * 1024:
+             # אם הסרטון גדול מ-50MB - זו מגבלה אפשרית בטלגרם או בשרת
+            bot.send_message(chat, "❌ הסרטון גדול מדי (מעל 50MB).")
             return
 
-        bot.edit_message_text("3/4. 📝 התרגום המסונכרן הושלם! מתחיל צריבת כתוביות לוידאו...", chat, ack_msg.message_id)
+        url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_info.file_path}"
+        data = requests.get(url, timeout=30).content # הוספת timeout להורדה
 
-        # --- Stage 4: Create Subtitle File (SRT format) ---
-        temp_sub_file = tempfile.NamedTemporaryFile(suffix=".srt", mode="w", encoding="utf-8", delete=False)
-        temp_paths['sub'] = temp_sub_file.name
+        temp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        temp.write(data)
+        temp.close()
         
-        # Write the final Hebrew SRT content
-        temp_sub_file.write(final_translated_srt)
-        temp_sub_file.close()
+        # 2. אימות אורך הסרטון
+        try:
+            clip = VideoFileClip(temp.name)
+            if clip.duration > 305:
+                bot.send_message(chat, "❌ הסרטון ארוך מ־5 דקות.")
+                clip.close()
+                return
+            clip.close()
+        except Exception:
+             bot.send_message(chat, "❌ שגיאה בקריאת קובץ וידאו (ייתכן שאינו תקין).")
+             raise
 
-        # --- Stage 5: Burn Subtitles (FFMPEG) ---
-        temp_output_file = tempfile.NamedTemporaryFile(suffix="_subbed.mp4", delete=False)
-        temp_output_file.close()
-        temp_paths['output'] = temp_output_file.name
-        
-        burn_subtitles_fast(temp_paths['video'], temp_paths['sub'], temp_paths['output'])
 
-        bot.edit_message_text("4/4. 🎥 צריבת הכתוביות הסתיימה! שולח את הוידאו...", chat, ack_msg.message_id)
+        # 3. תמלול האודיו
+        send_progress(chat, "🎧 מפענח אודיו (כולל זמנים)...")
+        try:
+            with open(temp.name, "rb") as f:
+                resp = client.audio.transcriptions.create(
+                    model="whisper-large-v3-turbo",
+                    file=f,
+                    response_format="verbose_json"
+                )
+            segments = resp.segments
+        except Exception as e:
+            bot.send_message(chat, f"❌ שגיאה בתמלול Groq: {e}")
+            raise
 
-        # --- Stage 6: Send the Result ---
-        caption_original = original_text[:150] + "..." if len(original_text) > 150 else original_text
-        
-        with open(temp_paths['output'], 'rb') as final_video:
-            bot.send_video(
-                chat, 
-                final_video, 
-                caption=f"✅ <b>סרטון מתורגם לעברית</b> באמצעות Groq.\n\n<u>הטקסט המקורי:</u> <i>{caption_original}</i>",
-                supports_streaming=True
-            )
-        
-        # Delete the acknowledgment message after completion
-        bot.delete_message(chat, ack_msg.message_id)
+        # 4. תרגום
+        send_progress(chat, "🌍 מתרגם כל שורה...")
+        try:
+            for s in segments:
+                s["text"] = translator.translate(s["text"])
+        except Exception as e:
+            bot.send_message(chat, f"❌ שגיאה בשירות התרגום: {e}")
+            raise
+
+        # 5. שריפת כתוביות
+        send_progress(chat, "🔥 שורף כתוביות (offset 1.8s)...")
+        try:
+            out_path = burn_subtitles(temp.name, segments, offset=1.8)
+        except Exception as e:
+            bot.send_message(chat, f"❌ שגיאה בשריפת כתוביות: {e}")
+            raise
+
+
+        # 6. העלאת הסרטון
+        send_progress(chat, "📤 מעלה את הסרטון...")
+        with open(out_path, "rb") as f:
+            bot.send_video(chat, f, caption="✅ הנה הסרטון שלך!")
 
     except Exception as e:
-        error_type = type(e).__name__
-        print(f"General Error: {error_type} - {e}")
-        # Use traceback.format_exc() to get the full error details
-        safe_send_error_message(
-            chat, 
-            f"אירעה שגיאה קריטית במהלך העיבוד ({error_type}).",
-            traceback.format_exc()
-        )
-        
+        # טיפול שגיאות כללי
+        error_msg = f"❌ שגיאה בלתי צפויה: {type(e).__name__} - {e}"
+        bot.send_message(chat, error_msg)
+        print(traceback.format_exc())
+
     finally:
-        # --- Stage 7: Cleanup ---
-        for path_type, path in temp_paths.items():
-            if os.path.exists(path):
-                try:
-                    os.unlink(path)
-                except Exception as e:
-                    print(f"Error during cleanup of {path_type} file: {e}")
+        # ניקיון קבצים (חשוב מאוד!)
+        if temp and os.path.exists(temp.name):
+            os.remove(temp.name)
+        if out_path and os.path.exists(out_path):
+            os.remove(out_path)
 
-# --- Webhook and Server Setup ---
 
-# Use environment variable for the webhook URL to be flexible (usually set by Render)
-WEBHOOK_URL_BASE = os.environ.get('WEBHOOK_URL_BASE')
-# The route Telegram will hit
-WEBHOOK_URL_PATH = "/bot/" + BOT_TOKEN 
+# ============================================
+# RUN
+# ============================================
+def run_bot():
+    bot.infinity_polling(timeout=60, long_polling_timeout=60)
 
-@app.route(WEBHOOK_URL_PATH, methods=['POST'])
-def webhook():
-    """Handles incoming webhook POST requests from Telegram."""
-    if request.headers.get('content-type') == 'application/json':
-        json_string = request.get_data().decode('utf-8')
-        update = telebot.types.Update.de_json(json_string)
-        bot.process_new_updates([update])
-        return 'ok', 200
-    return 'Content-Type must be application/json', 400
 
-@app.route('/')
-def home():
-    """Simple Flask route for Render Heartbeat/Health check."""
-    return {"status": "OK", "message": "Bot is running and listening for webhooks."}
-
-def set_webhook_and_run():
-    """Sets the Telegram Webhook URL and starts the Flask server."""
-    if WEBHOOK_URL_BASE:
-        full_url = WEBHOOK_URL_BASE.rstrip('/') + WEBHOOK_URL_PATH
-        bot.remove_webhook()
-        time.sleep(1) # Give Telegram a moment
-        if bot.set_webhook(url=full_url):
-             print(f"Webhook set successfully to: {full_url}")
-        else:
-             print("Failed to set webhook!")
-    else:
-        # Fallback to Polling if WEBHOOK_URL_BASE is not set (e.g., local run)
-        print("WEBHOOK_URL_BASE not set. Starting TeleBot Polling...")
-        # Start Polling in a thread if we are not using Webhooks
-        threading.Thread(target=lambda: bot.polling(non_stop=True, interval=2), daemon=True).start()
-
-    # Start the Flask web server (must be run in the main thread for Render)
-    print("Flask Server מתחיל...")
-    app.run(host='0.0.0.0', port=os.environ.get('PORT', 10000))
-
-if __name__ == '__main__':
-    # We call the combined function to initialize webhook/polling and start the server
-    set_webhook_and_run()
+if __name__ == "__main__":
+    threading.Thread(target=run_bot, daemon=True).start()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
