@@ -6,6 +6,7 @@ import traceback
 import threading
 import re
 import json # Import for JSON parsing
+import html # NEW: Import for HTML escaping the traceback
 from dotenv import load_dotenv
 
 # Import for Telegram and Flask
@@ -47,6 +48,8 @@ app = Flask(__name__)
 def safe_send_error_message(chat_id, error_message, full_traceback=""):
     """
     Sends an error message to the user, ensuring the text does not exceed 4096 characters.
+    The traceback is HTML-escaped to prevent Telegram's parser from misinterpreting code snippets 
+    (like <listcomp>) as invalid HTML tags.
     """
     full_message = f"❌ <b>שגיאה קריטית:</b> {error_message}\n\n"
     
@@ -56,12 +59,16 @@ def safe_send_error_message(chat_id, error_message, full_traceback=""):
         if len(full_traceback) > MAX_TRACEBACK_LEN:
             full_traceback = full_traceback[:MAX_TRACEBACK_LEN] + "\n... [המשך השגיאה קוצץ] ..."
         
-        full_message += f"<u>פרטים טכניים:</u>\n<pre>{full_traceback}</pre>"
+        # CRITICAL FIX: Escape HTML characters in the traceback to prevent Telegram from misinterpreting them.
+        escaped_traceback = html.escape(full_traceback)
+        
+        full_message += f"<u>פרטים טכניים:</u>\n<pre>{escaped_traceback}</pre>"
     
     try:
         # Use HTML parse mode for better formatting and code block support
         bot.send_message(chat_id, full_message, parse_mode='HTML')
     except telebot.apihelper.ApiTelegramException as e:
+        # Fallback if even the error sending fails (e.g., due to extreme length or other API issues)
         bot.send_message(chat_id, f"❌ שגיאה קריטית: לא ניתן לשלוח את פרטי השגיאה. (שגיאה: {e})")
 
 # FFMPEG Command: Subtitle burning and re-encoding
@@ -202,14 +209,17 @@ def get_transcript_and_translation(audio_data):
         return original_text, final_translated_srt
     
     except json.JSONDecodeError as e:
-        raise RuntimeError(f"LLM translation failed to return clean JSON output for parsing. Error: {e} - Raw LLM Output: {translated_json_string[:500]}...")
+        # Include a snippet of the raw output for debugging JSON issues
+        raw_output_snippet = translated_json_string[:500] if 'translated_json_string' in locals() else "N/A"
+        raise RuntimeError(f"LLM translation failed to return clean JSON output for parsing. Error: {e} - Raw LLM Output: {raw_output_snippet}...")
     except Exception as e:
          # Catch Groq's BadRequestError and re-raise it nicely
          raise RuntimeError(f"Groq API call failed during processing. Error: {e}")
     
     finally:
         # Clean up the temporary audio file
-        os.unlink(temp_audio_file_name)
+        if 'temp_audio_file_name' in locals() and os.path.exists(temp_audio_file_name):
+            os.unlink(temp_audio_file_name)
 
 
 # --- Telegram Handlers ---
