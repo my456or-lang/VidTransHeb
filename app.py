@@ -26,8 +26,9 @@ BOT_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 GROQ_API_KEY = os.environ.get('GROQ_API_KEY')
 ADMIN_USER_ID = os.environ.get('ADMIN_USER_ID') # Optional: For admin alerts
 FFMPEG_TIMEOUT = 300 # 5 minutes timeout for FFMPEG 
-# Using the current, supported 70B model for translation quality.
-LLM_MODEL = "llama3-70b-8192" 
+# CRITICAL FIX: The previous model llama3-70b-8192 has been decommissioned. 
+# Swapping to the current, supported Llama 3.1 model for translation.
+LLM_MODEL = "llama3.1-8b-8192" 
 
 # Initialize Clients
 try:
@@ -147,7 +148,7 @@ def get_transcript_and_translation(audio_data):
                 file=(temp_audio_file_name, audio_file.read()),
                 model="whisper-large-v3",
                 response_format="verbose_json"
-                # Removed 'language="en"' to enable Whisper's auto-detection.
+                # Whisper will auto-detect the language
             )
             
         # transcript_response_json is the outer Groq object (with .text and .segments)
@@ -161,7 +162,7 @@ def get_transcript_and_translation(audio_data):
         
         # --- 2. Translation using Groq LLM ---
         
-        # System instruction to guide the LLM's output - now language agnostic.
+        # System instruction to guide the LLM's output - language agnostic translation to HEBREW.
         system_prompt = "You are a professional subtitle translator. Your task is to translate a large block of text that has been segmented into subtitle-length chunks. Translate the following list of segments into high-quality, clear, and colloquial Hebrew. The source language is determined by the input text. The output MUST be a valid JSON array, where each element is a string containing the Hebrew translation for the corresponding segment. The output MUST ONLY contain the JSON array, nothing else."
 
         # Access the segment text using dictionary keys ('text')
