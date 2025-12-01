@@ -1,8 +1,11 @@
 flask
 pyTelegramBotAPI
 requests
+moviepy==1.0.3
 Pillow
 deep-translator
 groq
 python-dotenv
-ffmpeg-python
+imageio==2.33.1
+python-bidi
+arabic-reshaper
