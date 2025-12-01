@@ -26,7 +26,8 @@ BOT_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 GROQ_API_KEY = os.environ.get('GROQ_API_KEY')
 ADMIN_USER_ID = os.environ.get('ADMIN_USER_ID') # Optional: For admin alerts
 FFMPEG_TIMEOUT = 300 # 5 minutes timeout for FFMPEG 
-LLM_MODEL = "llama3-8b-8192" # A smaller, more stable Groq LLM for translation
+# Using the current, supported 70B model for translation quality.
+LLM_MODEL = "llama3-70b-8192" 
 
 # Initialize Clients
 try:
@@ -145,8 +146,8 @@ def get_transcript_and_translation(audio_data):
             transcript_response_json = groq_client.audio.transcriptions.create(
                 file=(temp_audio_file_name, audio_file.read()),
                 model="whisper-large-v3",
-                response_format="verbose_json", 
-                language="en" # Source language
+                response_format="verbose_json"
+                # Removed 'language="en"' to enable Whisper's auto-detection.
             )
             
         # transcript_response_json is the outer Groq object (with .text and .segments)
@@ -160,17 +161,16 @@ def get_transcript_and_translation(audio_data):
         
         # --- 2. Translation using Groq LLM ---
         
-        # System instruction to guide the LLM's output
-        system_prompt = "You are a professional subtitle translator. Your task is to translate a large block of text that has been segmented into subtitle-length chunks. Translate the following list of segments into high-quality, clear, and colloquial Hebrew. The output MUST be a valid JSON array, where each element is a string containing the Hebrew translation for the corresponding English segment. The output MUST ONLY contain the JSON array, nothing else."
+        # System instruction to guide the LLM's output - now language agnostic.
+        system_prompt = "You are a professional subtitle translator. Your task is to translate a large block of text that has been segmented into subtitle-length chunks. Translate the following list of segments into high-quality, clear, and colloquial Hebrew. The source language is determined by the input text. The output MUST be a valid JSON array, where each element is a string containing the Hebrew translation for the corresponding segment. The output MUST ONLY contain the JSON array, nothing else."
 
-        # CRITICAL FIX: Access the segment text using dictionary keys ('text') instead of attributes (.text)
+        # Access the segment text using dictionary keys ('text')
         original_segment_texts = [s['text'].strip() for s in original_segments]
         
-        # Use the JSON structure to ensure the LLM returns the output in the required format
-        # This is CRITICAL for matching the original segments back to the translations.
+        # Updated user query to be language agnostic
+        user_query = f"Translate the following array of segments into Hebrew. Provide the output as a JSON array of strings:\n\n{json.dumps(original_segment_texts, ensure_ascii=False)}"
         
-        user_query = f"Translate the following array of English segments into Hebrew. Provide the output as a JSON array of strings:\n\n{json.dumps(original_segment_texts, ensure_ascii=False)}"
-        
+        # Use the updated LLM model
         translation_response = groq_client.chat.completions.create(
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -222,7 +222,6 @@ def get_transcript_and_translation(audio_data):
 
 
 # --- Telegram Handlers ---
-# (The rest of the code remains the same)
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
