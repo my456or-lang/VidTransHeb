@@ -6,7 +6,7 @@ import traceback
 import threading
 import re
 import json # Import for JSON parsing
-import html # NEW: Import for HTML escaping the traceback
+import html # Import for HTML escaping the traceback
 from dotenv import load_dotenv
 
 # Import for Telegram and Flask
@@ -141,7 +141,6 @@ def get_transcript_and_translation(audio_data):
 
     try:
         # --- 1. Transcription to Verbose JSON (for sync) ---
-        # FIX: Changed response_format to 'verbose_json' which is supported and provides segments/timestamps
         with open(temp_audio_file_name, "rb") as audio_file:
             transcript_response_json = groq_client.audio.transcriptions.create(
                 file=(temp_audio_file_name, audio_file.read()),
@@ -149,14 +148,14 @@ def get_transcript_and_translation(audio_data):
                 response_format="verbose_json", 
                 language="en" # Source language
             )
-            # transcript_response_json is a ChatCompletion object, we need to extract the JSON string if needed,
-            # but usually the Python client handles the deserialization for us, which we check below.
+            
+        # transcript_response_json is the outer Groq object (with .text and .segments)
+        original_segments = transcript_response_json.segments
         
-        # Check if the response is a dictionary/object with the expected structure
-        if not hasattr(transcript_response_json, 'segments') or not transcript_response_json.segments:
+        # Check if the segments list is empty
+        if not original_segments:
              raise RuntimeError("Whisper did not return valid segments for synchronization.")
              
-        original_segments = transcript_response_json.segments
         original_text = transcript_response_json.text
         
         # --- 2. Translation using Groq LLM ---
@@ -164,8 +163,8 @@ def get_transcript_and_translation(audio_data):
         # System instruction to guide the LLM's output
         system_prompt = "You are a professional subtitle translator. Your task is to translate a large block of text that has been segmented into subtitle-length chunks. Translate the following list of segments into high-quality, clear, and colloquial Hebrew. The output MUST be a valid JSON array, where each element is a string containing the Hebrew translation for the corresponding English segment. The output MUST ONLY contain the JSON array, nothing else."
 
-        # Create a list of the original English segment texts for the LLM
-        original_segment_texts = [s.text.strip() for s in original_segments]
+        # CRITICAL FIX: Access the segment text using dictionary keys ('text') instead of attributes (.text)
+        original_segment_texts = [s['text'].strip() for s in original_segments]
         
         # Use the JSON structure to ensure the LLM returns the output in the required format
         # This is CRITICAL for matching the original segments back to the translations.
@@ -198,8 +197,8 @@ def get_transcript_and_translation(audio_data):
         final_segments = []
         for i, original_segment in enumerate(original_segments):
             final_segments.append({
-                'start': original_segment.start, # Time in seconds (float)
-                'end': original_segment.end,   # Time in seconds (float)
+                'start': original_segment['start'], # Time in seconds (float) - Access using key
+                'end': original_segment['end'],   # Time in seconds (float) - Access using key
                 'text': translated_texts[i]    # Translated Hebrew text (str)
             })
 
@@ -223,7 +222,7 @@ def get_transcript_and_translation(audio_data):
 
 
 # --- Telegram Handlers ---
-# (The Telegram, Webhook, and FFMPEG parts remain the same as Fix 7)
+# (The rest of the code remains the same)
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
