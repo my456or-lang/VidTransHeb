@@ -9,3 +9,4 @@ python-dotenv
 imageio==2.33.1
 python-bidi
 arabic-reshaper
+gunicorn
