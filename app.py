@@ -113,7 +113,7 @@ def create_subtitle_image(text, video_w, video_h):
 # ============================================
 # BURN SUBTITLES (SEGMENTED)
 # ============================================
-def burn_subtitles(video_path, segments, offset=1.8):  # ← כאן שונה ל־1.8
+def burn_subtitles(video_path, segments, offset=0):  
 
     clip = VideoFileClip(video_path)
     w, h = clip.w, clip.h
@@ -229,9 +229,9 @@ def handle_video(message):
             raise
 
         # 5. שריפת כתוביות
-        send_progress(chat, "🔥 שורף כתוביות (offset 1.8s)...")
+        send_progress(chat, "🔥 שורף כתוביות (ללא קיזוז)...")
         try:
-            out_path = burn_subtitles(temp.name, segments, offset=1.8)
+            out_path = burn_subtitles(temp.name, segments, offset=0)
         except Exception as e:
             bot.send_message(chat, f"❌ שגיאה בשריפת כתוביות: {e}")
             raise
