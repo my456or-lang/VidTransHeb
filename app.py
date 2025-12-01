@@ -5,6 +5,7 @@ import tempfile
 import traceback
 import threading
 import re
+import json # Import for JSON parsing
 from dotenv import load_dotenv
 
 # Import for Telegram and Flask
@@ -94,48 +95,36 @@ def burn_subtitles_fast(input_path, subtitle_path, output_path):
     except Exception as e:
         raise e
 
-def parse_srt_content(srt_content):
-    """
-    Parses the SRT string into a list of subtitle blocks (index, time, text).
-    Returns: list of dicts: [{'index': 1, 'time': '00:00:00,000 --> 00:00:02,123', 'text': '...'}]
-    """
-    blocks = []
-    # Regex to capture Index, Time (full line), and Text
-    # This regex is designed to be robust against empty lines between blocks
-    # Note: \s*? makes the match non-greedy
-    srt_pattern = re.compile(r'(\d+)\s*?(\d{2}:\d{2}:\d{2},\d{3} --> \d{2}:\d{2}:\d{2},\d{3})\s*?(.*?)(?=\n\d+|\Z)', re.DOTALL)
+def convert_seconds_to_srt_time(seconds):
+    """Converts a floating-point number of seconds to SRT time format: HH:MM:SS,mmm"""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    remaining_seconds = seconds % 60
+    milliseconds = int((remaining_seconds - int(remaining_seconds)) * 1000)
     
-    matches = srt_pattern.findall(srt_content)
+    return f"{hours:02}:{minutes:02}:{int(remaining_seconds):02},{milliseconds:03}"
 
-    for index, time_str, text_block in matches:
-        # Clean up the text block (remove extra newlines/spaces)
-        clean_text = text_block.strip()
-        if clean_text:
-            blocks.append({
-                'index': int(index),
-                'time': time_str.strip(),
-                'text': clean_text
-            })
-            
-    return blocks
-
-def generate_new_srt(translated_blocks):
+def generate_new_srt(translated_segments):
     """
-    Generates a new SRT string from the translated blocks.
+    Generates a new SRT string from the translated segments.
+    Each segment contains 'start', 'end' (in seconds), and 'text' (Hebrew).
     """
     new_srt = ""
-    for block in translated_blocks:
-        new_srt += f"{block['index']}\n"
-        new_srt += f"{block['time']}\n"
-        new_srt += f"{block['text']}\n\n"
+    for i, segment in enumerate(translated_segments):
+        start_time = convert_seconds_to_srt_time(segment['start'])
+        end_time = convert_seconds_to_srt_time(segment['end'])
+        
+        new_srt += f"{i + 1}\n"
+        new_srt += f"{start_time} --> {end_time}\n"
+        new_srt += f"{segment['text']}\n\n"
+        
     return new_srt.strip()
-
 
 def get_transcript_and_translation(audio_data):
     """
-    1. Transcribes audio to English SRT (to get time synchronization).
+    1. Transcribes audio to verbose_json (to get time synchronization).
     2. Uses Groq LLM to translate the full transcript to Hebrew.
-    3. Rebuilds the SRT file with the Hebrew translation.
+    3. Rebuilds the segments with the Hebrew translation.
     Returns: original_text (str), translated_srt_content (str)
     """
     # Create a temporary file to hold the audio data
@@ -144,32 +133,37 @@ def get_transcript_and_translation(audio_data):
         temp_audio_file_name = temp_audio_file.name
 
     try:
-        # --- 1. Transcription to English SRT (for sync) ---
+        # --- 1. Transcription to Verbose JSON (for sync) ---
+        # FIX: Changed response_format to 'verbose_json' which is supported and provides segments/timestamps
         with open(temp_audio_file_name, "rb") as audio_file:
-            # We request SRT here. It will be the original language (English) with correct timing.
-            transcript_response_srt = groq_client.audio.transcriptions.create(
+            transcript_response_json = groq_client.audio.transcriptions.create(
                 file=(temp_audio_file_name, audio_file.read()),
                 model="whisper-large-v3",
-                response_format="srt", 
-                language="en"
+                response_format="verbose_json", 
+                language="en" # Source language
             )
-            original_srt_content = transcript_response_srt
+            # transcript_response_json is a ChatCompletion object, we need to extract the JSON string if needed,
+            # but usually the Python client handles the deserialization for us, which we check below.
         
-        # Parse the English SRT content to get the text blocks and timings
-        original_blocks = parse_srt_content(original_srt_content)
-        if not original_blocks:
-             return None, None
-        
-        # Combine the original text from all blocks for the LLM translation
-        original_text = " ".join([b['text'] for b in original_blocks])
+        # Check if the response is a dictionary/object with the expected structure
+        if not hasattr(transcript_response_json, 'segments') or not transcript_response_json.segments:
+             raise RuntimeError("Whisper did not return valid segments for synchronization.")
+             
+        original_segments = transcript_response_json.segments
+        original_text = transcript_response_json.text
         
         # --- 2. Translation using Groq LLM ---
         
         # System instruction to guide the LLM's output
-        system_prompt = "You are a professional subtitle translator. Translate the following English transcript into high-quality, clear, and colloquial Hebrew. The output must ONLY contain the translated text, nothing else. Do not add any greetings, explanations, or context."
+        system_prompt = "You are a professional subtitle translator. Your task is to translate a large block of text that has been segmented into subtitle-length chunks. Translate the following list of segments into high-quality, clear, and colloquial Hebrew. The output MUST be a valid JSON array, where each element is a string containing the Hebrew translation for the corresponding English segment. The output MUST ONLY contain the JSON array, nothing else."
 
-        # User prompt is the full original transcript
-        user_query = f"Translate the following English transcript into Hebrew:\n\n---\n{original_text}\n---"
+        # Create a list of the original English segment texts for the LLM
+        original_segment_texts = [s.text.strip() for s in original_segments]
+        
+        # Use the JSON structure to ensure the LLM returns the output in the required format
+        # This is CRITICAL for matching the original segments back to the translations.
+        
+        user_query = f"Translate the following array of English segments into Hebrew. Provide the output as a JSON array of strings:\n\n{json.dumps(original_segment_texts, ensure_ascii=False)}"
         
         translation_response = groq_client.chat.completions.create(
             messages=[
@@ -179,46 +173,39 @@ def get_transcript_and_translation(audio_data):
             model=LLM_MODEL,
             temperature=0.1
         )
-        translated_full_text = translation_response.choices[0].message.content.strip()
-
-        # --- 3. Re-Segmentation (The Smart Part) ---
-        # The LLM gives us one block of translated text. We need to split this new Hebrew
-        # text back into the original timings (blocks) to maintain sync.
-
-        # Simple approach: Split the Hebrew text by sentence/period and distribute it 
-        # back into the original blocks. This is an approximation but better than one large subtitle.
         
-        # Split the translated text into chunks (sentences)
-        # We use a non-greedy split based on common sentence delimiters (., !, ?)
-        hebrew_chunks = re.split(r'([.!?])\s*', translated_full_text)
-        # Filter out empty strings and re-combine the delimiter with the sentence
-        hebrew_sentences = ["".join(i).strip() for i in zip(hebrew_chunks[0::2], hebrew_chunks[1::2])]
-        # Add the last element if it was a final chunk without a delimiter
-        if len(hebrew_chunks) % 2 != 0 and hebrew_chunks[-1].strip():
-            hebrew_sentences.append(hebrew_chunks[-1].strip())
-            
-        translated_blocks = []
-        sentence_index = 0
+        # Extract the JSON string from the LLM response
+        translated_json_string = translation_response.choices[0].message.content.strip()
+
+        # Clean up the JSON string (LLMs sometimes add ```json and extra text)
+        translated_json_string = re.sub(r"```json|```", "", translated_json_string, flags=re.IGNORECASE).strip()
         
-        for block in original_blocks:
-            # If we have sentences left, use the next one as the subtitle for this block
-            if sentence_index < len(hebrew_sentences):
-                # Using the translated sentence as the text for the current block's timing
-                block['text'] = hebrew_sentences[sentence_index]
-                translated_blocks.append(block)
-                sentence_index += 1
-            else:
-                 # If we run out of sentences, we just use the last one (shouldn't happen with good LLM output)
-                 block['text'] = translated_blocks[-1]['text'] if translated_blocks else "..."
-                 translated_blocks.append(block)
+        # Parse the JSON array
+        translated_texts = json.loads(translated_json_string)
+        
+        if len(translated_texts) != len(original_segments):
+             raise RuntimeError(f"Translation segments mismatch: Expected {len(original_segments)} translations but got {len(translated_texts)}.")
+
+        # --- 3. Rebuild the Segments with Hebrew Text ---
+        
+        final_segments = []
+        for i, original_segment in enumerate(original_segments):
+            final_segments.append({
+                'start': original_segment.start, # Time in seconds (float)
+                'end': original_segment.end,   # Time in seconds (float)
+                'text': translated_texts[i]    # Translated Hebrew text (str)
+            })
 
         # Generate the final SRT file content with Hebrew text and correct timings
-        final_translated_srt = generate_new_srt(translated_blocks)
+        final_translated_srt = generate_new_srt(final_segments)
         
         return original_text, final_translated_srt
     
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"LLM translation failed to return clean JSON output for parsing. Error: {e} - Raw LLM Output: {translated_json_string[:500]}...")
     except Exception as e:
-         raise RuntimeError(f"Groq API call failed during transcription/translation/LLM. Error: {e}")
+         # Catch Groq's BadRequestError and re-raise it nicely
+         raise RuntimeError(f"Groq API call failed during processing. Error: {e}")
     
     finally:
         # Clean up the temporary audio file
@@ -226,6 +213,7 @@ def get_transcript_and_translation(audio_data):
 
 
 # --- Telegram Handlers ---
+# (The Telegram, Webhook, and FFMPEG parts remain the same as Fix 7)
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
@@ -283,11 +271,11 @@ def handle_video(message):
              
         bot.edit_message_text("2/4. 🎤 אודיו הופק בהצלחה. מתחיל שעתוק, תרגום (LLM) וסנכרון...", chat, ack_msg.message_id)
         
-        # --- Stage 3: Transcription and Translation (Whisper SRT + LLM) ---
+        # --- Stage 3: Transcription and Translation (Whisper Verbose JSON + LLM) ---
         with open(temp_paths['audio'], "rb") as f:
             audio_bytes = f.read()
         
-        # original_text is the transcript, final_translated_srt is the full SRT file content (Hebrew)
+        # original_text is the full transcript, final_translated_srt is the full SRT file content (Hebrew, synchronized)
         original_text, final_translated_srt = get_transcript_and_translation(audio_bytes)
 
         if not final_translated_srt:
